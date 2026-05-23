@@ -37,13 +37,15 @@ def _resample(raw, freq):
 
 
 def run_today(symbol: str, shares: int = None,
-              rip_levels: dict = None, date_str: str = None):
+              rip_levels: dict = None, date_str: str = None,
+              df_spy_10m=None):
     """
     Download 60 days of 5-min data for EMA warm-up, simulate entries on today only.
 
-    shares:     if None (default), sized dynamically from MAX_RISK_PER_TRADE / stop_distance
-    rip_levels: optional dict with keys 'support', 'resistance', 'bias'
-                e.g. {"support": 219.20, "resistance": 220.46, "bias": "long"}
+    shares:      if None (default), sized dynamically from MAX_RISK_PER_TRADE / stop_distance
+    rip_levels:  optional dict with keys 'support', 'resistance', 'bias'
+    df_spy_10m:  pre-built SPY 10-min DataFrame for market regime filter (optional).
+                 If provided, long signals are skipped when SPY is bearish and vice versa.
     """
     print(f"\n{'='*55}")
     label = f"  {symbol}  |  {'auto-sized' if shares is None else str(shares) + ' shares'}"
@@ -193,8 +195,9 @@ def run_today(symbol: str, shares: int = None,
         if signal == lost_dir_today:
             continue
 
-        # No bias filter — take what the market gives us.
-        # The EMA signal engine decides direction based on cloud alignment alone.
+        # (SPY regime filter removed — lags on same-day reversals and is too
+        #  blunt for counter-market setups like shorting a bearish stock on
+        #  an otherwise bullish market day.)
 
         entry_price  = cur["close"]
         stop_dist    = abs(entry_price - stop_price)
@@ -278,9 +281,18 @@ if __name__ == "__main__":
                  "note": "BofA downgrade (Tier 1 bank)"},
     }
 
+    # Download SPY once for the market regime filter
+    print("\n  Loading SPY market regime filter...")
+    _spy = yf.download("SPY", period="60d", interval="5m",
+                       progress=False, auto_adjust=True, prepost=False)
+    if isinstance(_spy.columns, pd.MultiIndex):
+        _spy.columns = _spy.columns.get_level_values(0)
+    _spy = _spy.tz_convert("US/Eastern").between_time("09:30", "16:00")
+    _df_spy_10m = _resample(_spy, "10min")
+
     all_trades = []
     for sym, levels in setups.items():
-        t = run_today(sym, shares=100, rip_levels=levels)
+        t = run_today(sym, shares=100, rip_levels=levels, df_spy_10m=_df_spy_10m)
         all_trades.extend(t)
 
     wins   = [t for t in all_trades if t["pnl"] > 0]

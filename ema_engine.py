@@ -210,6 +210,17 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str,
 
     entry_price = cur.close
 
+    # Opening-bar gate — no entries at all before 09:40 ET.
+    # The first 1-2 candles capture the gap open and are extremely noisy:
+    # EMAs lag, clouds are distorted, and nearly any signal type fires spuriously.
+    # Rip's own rule: "wait for the open to settle" = let the 09:30-09:39 bars
+    # establish a range before committing.  All entry types are blocked here;
+    # the first tradeable bar is 09:40.
+    is_opening_bar = (bar_time is not None and
+                      bar_time.hour == 9 and bar_time.minute < 40)
+    if is_opening_bar:
+        return "none", 0.0
+
     # --- Volume gate ---
     vol_above_avg = (cur.vol_ma20 <= 0 or
                      cur.volume >= VOLUME_CONFIRM_MULT * cur.vol_ma20)
@@ -282,31 +293,30 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str,
                           vol_above_avg)
 
     # TYPE 3 guards:
-    #   - No longs against a confirmed bearish 10-min trend (and vice versa).
-    #   - No TYPE 3 in the first 10 minutes of the session (09:30-09:39 ET):
-    #     the opening bar is a single candle capturing the gap open — it nearly
-    #     always "touches and bounces" the cloud, generating noise signals.
-    #     Wait for price to settle before trusting reversal bounces.
-    is_opening_bar = (bar_time is not None and
-                      bar_time.hour == 9 and bar_time.minute < 40)
+    #   Require a confirmed 10-min trend in the SAME direction.
+    #   A 3-min reversal bounce with no 10-min backing (trend=none) is more
+    #   likely a dead-cat bounce in choppy midday conditions than a real reversal.
 
-    if cloud_bounce_long and trend != "bearish" and not is_opening_bar:
+    if cloud_bounce_long and trend == "bullish":
         stop = compute_stop(df_3m, "long", entry_price)
         if _stop_ok(entry_price, stop, "long"):
             return "long", stop
 
-    if cloud_bounce_short and trend != "bullish" and not is_opening_bar:
+    if cloud_bounce_short and trend == "bearish":
         stop = compute_stop(df_3m, "short", entry_price)
         if _stop_ok(entry_price, stop, "short"):
             return "short", stop
 
     # --- TYPE 2: taking off from cloud level in an established trend ---
-    if trend == "bullish" and _taking_off(cur, "long") and cur.ema5 > cur.ema12:
+    # Candle must be GREEN for longs (close > open) and RED for shorts (close < open).
+    # A bar that dips to the cloud but only half-recovers while still closing below its
+    # open is NOT "taking off" — it's a weak bounce that often fails immediately.
+    if trend == "bullish" and _taking_off(cur, "long") and cur.ema5 > cur.ema12 and cur.close > cur.open:
         stop = compute_stop(df_3m, "long", entry_price)
         if _stop_ok(entry_price, stop, "long"):
             return "long", stop
 
-    if trend == "bearish" and _taking_off(cur, "short") and cur.ema5 < cur.ema12:
+    if trend == "bearish" and _taking_off(cur, "short") and cur.ema5 < cur.ema12 and cur.close < cur.open:
         stop = compute_stop(df_3m, "short", entry_price)
         if _stop_ok(entry_price, stop, "short"):
             return "short", stop
@@ -317,7 +327,7 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str,
     # The previous bar must have closed on the other side of the level — this
     # ensures we catch only the crossing candle, not every bar above/below.
     # Fast cloud (5/12) and volume must confirm.
-    if pmh is not None and pml is not None and pmh > pml and not is_opening_bar:
+    if pmh is not None and pml is not None and pmh > pml:
         # 4a — crossing PMH/PML for the first time in the regular session
         pmh_break = (prev.close < pmh and cur.close > pmh and
                      cur.ema5 > cur.ema12 and vol_above_avg)
@@ -328,32 +338,29 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str,
         # ema12 must also be through the level (whole fast cloud cleared it).
         # Only fires if price is >GAP_THRESHOLD (2%) past the pre-market level
         # to avoid triggering on stocks that are just grazing the boundary.
+        # 4b — only for LONGS (above PMH).
+        # Gap-up stocks that hold above PMH tend to continue higher (DELL-style).
+        # Gap-DOWN stocks (below PML) almost always see a morning squeeze that
+        # exceeds a 2% stop before any resumption — TYPE 4b short is 0W in all
+        # tested data and structurally unreliable.  Use TYPE 4a for PML breaks.
         above_pmh = (cur.close  > pmh * (1 + GAP_THRESHOLD) and
                      cur.ema12  > pmh and
                      cur.ema5   > cur.ema12 and
-                     vol_above_avg)
-        below_pml = (cur.close  < pml * (1 - GAP_THRESHOLD) and
-                     cur.ema12  < pml and
-                     cur.ema5   < cur.ema12 and
+                     cur.close  > prev.close and   # momentum: bar still rising
                      vol_above_avg)
 
         if pmh_break or above_pmh:
             if above_pmh and not pmh_break:
-                # 4b: ema12 may still be far from price after a large gap.
-                # Use a 2% momentum floor so the stop is always tight enough
-                # to pass _stop_ok.  Once ema12 rises within 2% of entry it
-                # takes over automatically (max selects the higher = tighter).
+                # 4b: use 2% momentum floor when ema12 hasn't caught up yet
                 stop = max(cur.ema12, entry_price * (1 - MAX_STOP_PCT * 0.8))
             else:
-                stop = cur.ema12   # 4a: ema12 is close to the crossing level
+                stop = cur.ema12   # 4a crossing: ema12 is near the level
             if _stop_ok(entry_price, stop, "long"):
                 return "long", stop
 
-        if pml_break or below_pml:
-            if below_pml and not pml_break:
-                stop = min(cur.ema12, entry_price * (1 + MAX_STOP_PCT * 0.8))
-            else:
-                stop = cur.ema12
+        if pml_break:
+            # TYPE 4a only for shorts — first crossing below PML
+            stop = cur.ema12
             if _stop_ok(entry_price, stop, "short"):
                 return "short", stop
 
