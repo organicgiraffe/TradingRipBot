@@ -1,0 +1,4 @@
+ib-insync
+numpy
+pandas
+yfinance
