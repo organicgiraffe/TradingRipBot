@@ -6,7 +6,8 @@ from typing import Optional
 from ib_insync import IB, Stock, MarketOrder
 
 from config import (TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
-                    BAR_SIZE_10M, BAR_SIZE_3M, MAX_TRADES_PER_DAY)
+                    BAR_SIZE_10M, BAR_SIZE_3M, MAX_TRADES_PER_DAY,
+                    MAX_SIMULTANEOUS_POSITIONS)
 from ema_engine import (compute_emas, get_trend_10m,
                         get_entry_signal_3m, should_exit_3m,
                         compute_trailing_stop)
@@ -25,8 +26,9 @@ class TradingBot:
         self.bars_3m:  dict = {}   # symbol -> BarDataList  (entry + management)
         self.trend:    dict = {}   # symbol -> 'bullish' | 'bearish' | 'none'
 
-        self.position: Optional[Position] = None
-        self.trade_log: list[Position]    = []
+        # Up to MAX_SIMULTANEOUS_POSITIONS open at once, keyed by symbol.
+        self.positions: dict[str, Position] = {}
+        self.trade_log: list[Position]      = []
 
         # Per-symbol counters — each symbol independently tracks its own daily
         # trade count and direction block.  Only self.position is global (one
@@ -169,40 +171,38 @@ class TradingBot:
             self._lost_dir_today = {s: None for s in self.symbols}
             self._last_trade_date = today
 
-        # ---- Manage open position --------------------------------- #
-        if (self.position and self.position.is_open
-                and self.position.symbol == symbol):
+        # ---- Manage open position for this symbol -------------------- #
+        pos = self.positions.get(symbol)
+        if pos and pos.is_open:
 
             # Update trailing stop
             new_stop = compute_trailing_stop(
-                df_3m, self.position.direction,
-                self.position.stop_price, self.position.entry_price
+                df_3m, pos.direction, pos.stop_price, pos.entry_price
             )
-            self.position.update_stop(new_stop)
+            pos.update_stop(new_stop)
 
             # Live P&L display every bar
-            self._print_live_pnl(cur, now)
+            self._print_live_pnl(symbol, cur, now)
 
             # Stop hit?
-            if (self.position.direction == "long"
-                    and cur.low <= self.position.stop_price):
-                self._close_position(self.position.stop_price, now, "trailing stop")
+            if pos.direction == "long" and cur.low <= pos.stop_price:
+                self._close_position(symbol, pos.stop_price, now, "trailing stop")
                 return
-            if (self.position.direction == "short"
-                    and cur.high >= self.position.stop_price):
-                self._close_position(self.position.stop_price, now, "trailing stop")
+            if pos.direction == "short" and cur.high >= pos.stop_price:
+                self._close_position(symbol, pos.stop_price, now, "trailing stop")
                 return
 
-            # 3-min cloud flip?
-            if should_exit_3m(df_3m, self.position.direction):
-                self._close_position(cur.close, now, "3m cloud flip")
+            # Cloud exit?
+            if should_exit_3m(df_3m, pos.direction):
+                self._close_position(symbol, cur.close, now, "cloud exit")
             return
 
-        # ---- Entry ------------------------------------------------ #
-        if self.position is not None:
-            return   # different symbol in play
-
+        # ---- Entry --------------------------------------------------- #
         if self._trades_today[symbol] >= MAX_TRADES_PER_DAY:
+            return
+
+        # Hard cap: no new positions if both slots are already full
+        if len(self.positions) >= MAX_SIMULTANEOUS_POSITIONS:
             return
 
         trend = self.trend.get(symbol, "none")
@@ -217,7 +217,9 @@ class TradingBot:
             return
 
         entry_price = cur.close
-        log.info(f"ENTRY {signal.upper()} {symbol} @ {entry_price:.2f}  "
+        slot = len(self.positions) + 1
+        log.info(f"ENTRY [{slot}/{MAX_SIMULTANEOUS_POSITIONS}] "
+                 f"{signal.upper()} {symbol} @ {entry_price:.2f}  "
                  f"stop={stop_price:.2f}  "
                  f"[trade {self._trades_today[symbol] + 1}/{MAX_TRADES_PER_DAY}]")
         self._open_position(symbol, signal, entry_price, stop_price, now)
@@ -226,9 +228,9 @@ class TradingBot:
     # Order helpers
     # ------------------------------------------------------------------ #
 
-    def _print_live_pnl(self, cur, now: datetime):
-        """Compact one-line P&L update printed every 3-min bar while in a trade."""
-        p = self.position
+    def _print_live_pnl(self, symbol: str, cur, now: datetime):
+        """Compact one-line P&L update printed every bar while in a trade."""
+        p     = self.positions[symbol]
         price = cur.close
         if p.direction == "long":
             unrealised = (price - p.entry_price) * p.shares
@@ -238,9 +240,13 @@ class TradingBot:
             stop_dist  = p.stop_price - price
 
         sign   = "+" if unrealised >= 0 else ""
-        locked = " [LOCKED]" if unrealised >= 0 and abs(p.stop_price - p.entry_price) < 0.01 else ""
+        locked = (" [LOCKED]"
+                  if unrealised >= 0 and abs(p.stop_price - p.entry_price) < 0.01
+                  else "")
+        n_open = len(self.positions)
         print(
-            f"  {now.strftime('%H:%M')}  {p.direction.upper()} {p.symbol}"
+            f"  {now.strftime('%H:%M')}  [{n_open}/{MAX_SIMULTANEOUS_POSITIONS}]"
+            f"  {p.direction.upper()} {p.symbol}"
             f"  entry={p.entry_price:.2f}  now={price:.2f}"
             f"  PnL={sign}${unrealised:.0f}"
             f"  stop={p.stop_price:.2f} ({stop_dist:.2f} away)"
@@ -254,34 +260,40 @@ class TradingBot:
         self.ib.qualifyContracts(contract)
         trade = self.ib.placeOrder(contract, MarketOrder(action, self.shares))
 
-        self.position = Position(
+        pos = Position(
             symbol=symbol, direction=direction, shares=self.shares,
             entry_price=entry_price, entry_time=time,
             stop_price=stop_price,
             ibkr_order_id=trade.order.orderId,
         )
-        log.info(f"OPENED  {self.position.summary()}")
+        self.positions[symbol] = pos
+        log.info(f"OPENED [{len(self.positions)}/{MAX_SIMULTANEOUS_POSITIONS}]  "
+                 f"{pos.summary()}")
 
-    def _close_position(self, price: float, time: datetime, reason: str = ""):
-        if not self.position:
+    def _close_position(self, symbol: str, price: float,
+                        time: datetime, reason: str = ""):
+        pos = self.positions.get(symbol)
+        if not pos:
             return
-        action   = "SELL" if self.position.direction == "long" else "BUY"
-        contract = Stock(self.position.symbol, "SMART", "USD")
+
+        action   = "SELL" if pos.direction == "long" else "BUY"
+        contract = Stock(symbol, "SMART", "USD")
         self.ib.qualifyContracts(contract)
         self.ib.placeOrder(contract, MarketOrder(action, self.shares))
 
-        sym = self.position.symbol
-        self.position.close(price, time, reason)
-        self._trades_today[sym] += 1
+        pos.close(price, time, reason)
+        self._trades_today[symbol] += 1
 
-        log.info(f"CLOSED  {self.position.summary()}")
-        if self.position.pnl is not None and self.position.pnl < 0:   # scratch = not a loss
-            self._lost_dir_today[sym] = self.position.direction
-            log.info(f"Loss on {sym} — blocking {self._lost_dir_today[sym]} re-entries for {sym} today.")
-        if self._trades_today[sym] >= MAX_TRADES_PER_DAY:
-            log.info(f"{sym} daily limit reached ({MAX_TRADES_PER_DAY} trades). Done for {sym} today.")
-        self.trade_log.append(self.position)
-        self.position = None
+        log.info(f"CLOSED  {pos.summary()}")
+        if pos.pnl is not None and pos.pnl < 0:
+            self._lost_dir_today[symbol] = pos.direction
+            log.info(f"Loss on {symbol} — blocking "
+                     f"{self._lost_dir_today[symbol]} re-entries today.")
+        if self._trades_today[symbol] >= MAX_TRADES_PER_DAY:
+            log.info(f"{symbol} daily limit reached "
+                     f"({MAX_TRADES_PER_DAY} trades). Done for today.")
+        self.trade_log.append(pos)
+        del self.positions[symbol]
 
     # ------------------------------------------------------------------ #
     # Run
@@ -299,9 +311,13 @@ class TradingBot:
             print("No completed trades today.")
             return
         total_pnl = 0.0
+        wins = losses = 0
         for p in self.trade_log:
             print(f"  {p.summary()}")
             if p.pnl is not None:
                 total_pnl += p.pnl
-        print(f"  TOTAL P&L: ${total_pnl:+.2f}")
+                if p.pnl > 0: wins += 1
+                else: losses += 1
+        print(f"  {len(self.trade_log)} trades  |  {wins}W / {losses}L  |  "
+              f"TOTAL P&L: ${total_pnl:+.2f}")
         print("===========================\n")

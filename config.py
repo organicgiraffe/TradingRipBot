@@ -38,3 +38,4 @@ GAP_THRESHOLD        = 0.020  # ema50 > 2.0% from price = Day1 gap-up/down catal
                               # above this: use ema12 as tighter stop, allow TYPE 1b entry
 LAST_ENTRY_HOUR      = 15     # no new entries at or after this hour (ET)
 LAST_ENTRY_MINUTE    = 0      # → 15:00  gives at least 50 min for trade to develop
+MAX_SIMULTANEOUS_POSITIONS = 2   # max open positions across ALL symbols at once
