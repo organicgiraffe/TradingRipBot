@@ -1,9 +1,14 @@
 import pandas as pd
 from config import (EMA_PERIODS, MIN_BARS_10M, MIN_BARS_3M,
-                    MAX_STOP_DISTANCE, MAX_STOP_PCT,
-                    BREAKEVEN_TRIGGER, VOLUME_CONFIRM_MULT,
-                    CLOUD_EXIT_BUFFER,
-                    LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE)
+                    MAX_STOP_DISTANCE, MAX_STOP_PCT, MIN_STOP_PCT_LOWER,
+                    BREAKEVEN_TRIGGER, RATCHET_START, RATCHET_GIVEBACK,
+                    VOLUME_CONFIRM_MULT,
+                    CLOUD_EXIT_BUFFER, GAP_THRESHOLD,
+                    MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE,
+                    LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE,
+                    FRIDAY_OPEN_MINUTE,
+                    RVOL_EXIT_MULT,
+                    ATR_PERIODS, DTR_MAX_PCT)
 
 
 # ------------------------------------------------------------------ #
@@ -32,6 +37,66 @@ def compute_emas(bars: list) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ #
+# DTR / ATR ratio — Rip's range-exhaustion filter
+# "DTR: 6.21 vs ATR: 7.59  82%" — if today's range has already used up
+# most of the average daily range, the move is largely done.  Don't enter.
+# ------------------------------------------------------------------ #
+
+def compute_dtr_atr_ratio(df_10m: pd.DataFrame, target_date,
+                          bar_time=None,
+                          atr_periods: int = ATR_PERIODS) -> float:
+    """
+    Returns today's DTR/ATR ratio as a fraction (e.g. 0.82 = 82%).
+
+    DTR = today's high-low range up to bar_time (from 10-min bars).
+    ATR = simple average True Range of the past atr_periods trading days.
+          Strictly uses data BEFORE target_date — no lookahead.
+
+    Returns 0.0 when data is insufficient (caller treats 0 as "no filter").
+    """
+    if df_10m is None or df_10m.empty or len(df_10m) < 2:
+        return 0.0
+
+    # Collapse 10-min bars to daily OHLC
+    df_daily = (df_10m.groupby(df_10m.index.date)
+                      .agg(high=("high", "max"),
+                           low=("low",  "min"),
+                           close=("close", "last")))
+
+    if len(df_daily) < atr_periods + 1:
+        return 0.0
+
+    # True Range (vectorised: max of H-L, |H-prevC|, |L-prevC|)
+    hl = df_daily["high"] - df_daily["low"]
+    hc = (df_daily["high"] - df_daily["close"].shift(1)).abs()
+    lc = (df_daily["low"]  - df_daily["close"].shift(1)).abs()
+    df_daily["tr"] = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+
+    # ATR from the most-recent atr_periods days BEFORE today (no lookahead)
+    past = df_daily[df_daily.index < target_date].dropna(subset=["tr"])
+    if len(past) < atr_periods:
+        return 0.0
+
+    atr = float(past["tr"].tail(atr_periods).mean())
+    if atr <= 0:
+        return 0.0
+
+    # DTR: today's range so far (up to bar_time, or full day if None)
+    if bar_time is not None:
+        today_bars = df_10m[
+            (df_10m.index.date == target_date) & (df_10m.index <= bar_time)
+        ]
+    else:
+        today_bars = df_10m[df_10m.index.date == target_date]
+
+    if today_bars.empty:
+        return 0.0
+
+    dtr = float(today_bars["high"].max() - today_bars["low"].min())
+    return dtr / atr
+
+
+# ------------------------------------------------------------------ #
 # Stop quality gate — percentage-based so it works across all price levels
 # ------------------------------------------------------------------ #
 
@@ -45,8 +110,10 @@ def _stop_ok(entry_price: float, stop_price: float, direction: str) -> bool:
             else stop_price - entry_price)
     if dist <= 0:
         return False
-    return (dist / entry_price <= MAX_STOP_PCT and
-            dist <= MAX_STOP_DISTANCE * 3)   # hard cap = 3x legacy limit
+    pct = dist / entry_price
+    return (pct >= MIN_STOP_PCT_LOWER and      # floor: tighter than 0.25% = noise
+            pct <= MAX_STOP_PCT and            # ceiling: wider than 2.5% = too much risk
+            dist <= MAX_STOP_DISTANCE * 3)     # hard dollar cap
 
 
 # ------------------------------------------------------------------ #
@@ -70,29 +137,37 @@ def compute_stop(df_3m: pd.DataFrame, direction: str, entry_price: float) -> flo
 # ------------------------------------------------------------------ #
 
 def compute_trailing_stop(df_3m: pd.DataFrame, direction: str,
-                          current_stop: float, entry_price: float) -> float:
+                          current_stop: float, entry_price: float,
+                          best_unrealised: float = 0.0) -> float:
     """
     Trail the stop to the current ema50 (the slow cloud's far edge).
     As price rises (longs), ema50 rises with it — we trail up.
     As price falls (shorts), ema50 falls — we trail down.
 
-    Rules:
-      - Stop never moves against the position.
-      - Once BREAKEVEN_TRIGGER ($5) profitable, stop locks at entry minimum.
+    Ratchet rule (replaces the old flat breakeven trigger):
+      Pass best_unrealised = highest per-share profit seen so far.
+      Once best_unrealised >= RATCHET_START ($3), the stop floor rises:
+        floor = entry + max(0, best_unrealised - RATCHET_GIVEBACK)
+      e.g. best +$6  → floor = entry + $3  (locks $300 on 100 shares)
+           best +$10 → floor = entry + $7  (locks $700 on 100 shares)
+
+      Using the high-water-mark (not current close) prevents the intrabar
+      phantom stop where a single bar's high triggers the ratchet then the
+      same bar's low immediately hits it.
     """
     cur = df_3m.iloc[-1]
     trail_to = cur.ema50
 
     if direction == "long":
-        unrealised = cur.close - entry_price
-        if unrealised >= BREAKEVEN_TRIGGER:
-            trail_to = max(trail_to, entry_price)   # never below entry
+        if best_unrealised >= RATCHET_START:
+            floor = entry_price + max(0.0, best_unrealised - RATCHET_GIVEBACK)
+            trail_to = max(trail_to, floor)
         return max(current_stop, trail_to)          # never move stop down
 
     else:  # short
-        unrealised = entry_price - cur.close
-        if unrealised >= BREAKEVEN_TRIGGER:
-            trail_to = min(trail_to, entry_price)   # never above entry
+        if best_unrealised >= RATCHET_START:
+            floor = entry_price - max(0.0, best_unrealised - RATCHET_GIVEBACK)
+            trail_to = min(trail_to, floor)
         return min(current_stop, trail_to)          # never move stop up
 
 
@@ -159,9 +234,16 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
     prev = df_3m.iloc[-2]
     entry_price = cur.close
 
-    # No entries in the first 10 minutes — let the open settle
-    if bar_time is not None and bar_time.hour == 9 and bar_time.minute < 40:
-        return "none", 0.0
+    # No entries before the first 3-min bar closes (09:33 ET).
+    # On Fridays (options expiry / Lotto Friday) push to 09:45 — the open
+    # bar is hit by violent expiry-driven moves that stop out clean setups.
+    if bar_time is not None:
+        is_friday  = (bar_time.weekday() == 4)
+        open_minute = FRIDAY_OPEN_MINUTE if is_friday else MARKET_OPEN_MINUTE
+        if (bar_time.hour < MARKET_OPEN_HOUR or
+                (bar_time.hour == MARKET_OPEN_HOUR
+                 and bar_time.minute < open_minute)):
+            return "none", 0.0
 
     # No new entries after 15:00 — not enough time for trade to develop before close
     if bar_time is not None:
@@ -172,6 +254,13 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
 
     # Volume gate — above-average participation confirms the move is real
     if cur.vol_ma20 > 0 and cur.volume < VOLUME_CONFIRM_MULT * cur.vol_ma20:
+        return "none", 0.0
+
+    # Trend gate — 10m must show a clear direction.
+    # When trend is 'none', both clouds are mixed or price is straddling ema200.
+    # C2 flips in that environment are noise — skip everything.
+    # The plan keeps us in strong stocks; the trend gate keeps us in strong moments.
+    if trend == "none":
         return "none", 0.0
 
     # Cloud 2 flip: ema5 crosses ema12
@@ -210,33 +299,86 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if _stop_ok(entry_price, stop, "short"):
             return "short", stop
 
+    # ---- PMH breakout: first bar to close above pre-market high, C3 green ----
+    if pmh is not None and c3_green and cur.close > pmh and prev.close <= pmh:
+        gap_pct = (entry_price - cur.ema50) / entry_price if entry_price > 0 else 0
+        stop    = cur.ema12 if gap_pct > GAP_THRESHOLD else cur.ema50
+        if support is not None and support > stop and support < entry_price:
+            stop = support
+        if _stop_ok(entry_price, stop, "long"):
+            return "long", stop
+
+    # ---- PML breakdown: first bar to close below pre-market low, C3 red ----
+    if pml is not None and c3_red and cur.close < pml and prev.close >= pml:
+        gap_pct = (cur.ema50 - entry_price) / entry_price if entry_price > 0 else 0
+        stop    = cur.ema12 if gap_pct > GAP_THRESHOLD else cur.ema50
+        if resistance is not None and resistance < stop and resistance > entry_price:
+            stop = resistance
+        if _stop_ok(entry_price, stop, "short"):
+            return "short", stop
+
     return "none", 0.0
 
 
 # ------------------------------------------------------------------ #
-# 3-min exit — slow cloud (34/50) violation
+# 3-min exit — fast cloud (5/12) flip
 # ------------------------------------------------------------------ #
 
 def should_exit_3m(df_3m: pd.DataFrame, direction: str) -> bool:
     """
-    Exit long:  3-min candle closes below ema34 (price enters slow cloud from above)
-    Exit short: 3-min candle closes above ema34 (price enters slow cloud from below)
+    Exit long:  fast cloud (ema5/ema12) flips RED  — prev bar ema5>=ema12, cur ema5<ema12
+    Exit short: fast cloud (ema5/ema12) flips GREEN — prev bar ema5<=ema12, cur ema5>ema12
 
-    Ripster: "that 34-50 cloud is your risk level."
-    We hold through 5/12 wiggles (normal trend pullbacks) and only exit
-    when price actually breaks INTO the slow cloud.
-    The trailing stop at ema50 acts as the absolute floor below this.
+    This captures the momentum move and gets out early — exit when the fast cloud
+    reverses, not when price has already fallen all the way into the slow cloud.
+    The trailing stop at ema50 still acts as a hard floor if price gaps through.
+    """
+    if len(df_3m) < 2:
+        return False
+
+    cur  = df_3m.iloc[-1]
+    prev = df_3m.iloc[-2]
+
+    if direction == "long":
+        return prev.ema5 >= prev.ema12 and cur.ema5 < cur.ema12
+    if direction == "short":
+        return prev.ema5 <= prev.ema12 and cur.ema5 > cur.ema12
+    return False
+
+
+# ------------------------------------------------------------------ #
+# 10-min exit — fast cloud (5/12) flip on the higher timeframe
+# ------------------------------------------------------------------ #
+
+def should_exit_10m(df_10m: pd.DataFrame, direction: str) -> bool:
+    """
+    Exit when the 10-min fast cloud (ema5/ema12) flips against the position.
+    Gives the trade more room than the 3-min exit — only closes when the
+    higher-timeframe momentum has genuinely reversed.
+    """
+    if len(df_10m) < 2:
+        return False
+    cur  = df_10m.iloc[-1]
+    prev = df_10m.iloc[-2]
+    if direction == "long":
+        return prev.ema5 >= prev.ema12 and cur.ema5 < cur.ema12
+    if direction == "short":
+        return prev.ema5 <= prev.ema12 and cur.ema5 > cur.ema12
+    return False
+
+
+# ------------------------------------------------------------------ #
+# RVOL exit — relative volume dried up, momentum is gone
+# ------------------------------------------------------------------ #
+
+def should_exit_rvol(df_3m: pd.DataFrame) -> bool:
+    """
+    Exit when the current 3-min bar's volume drops below RVOL_EXIT_MULT × average.
+    When the crowd stops participating the move is over — don't wait for the cloud.
     """
     if len(df_3m) < 1:
         return False
-
     cur = df_3m.iloc[-1]
-
-    if direction == "long":
-        # Must close CLEARLY below ema34, not just graze the edge.
-        # CLOUD_EXIT_BUFFER ($0.10) prevents false exits on consolidation bars
-        # where close ≈ ema34 by a fraction of a cent.
-        return cur.close < cur.ema34 - CLOUD_EXIT_BUFFER
-    if direction == "short":
-        return cur.close > cur.ema34 + CLOUD_EXIT_BUFFER
-    return False
+    if cur.vol_ma20 <= 0:
+        return False
+    return (cur.volume / cur.vol_ma20) < RVOL_EXIT_MULT
