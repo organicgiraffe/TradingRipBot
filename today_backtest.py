@@ -189,7 +189,9 @@ def run_today(symbol: str, shares: int = None,
 
         signal, stop_price = get_entry_signal_3m(
             df_3m_now, trend, bar_time=bar_time,
-            pmh=pmh_today, pml=pml_today)
+            pmh=pmh_today, pml=pml_today,
+            support=rip_levels.get("support") if rip_levels else None,
+            resistance=rip_levels.get("resistance") if rip_levels else None)
         if signal == "none":
             continue
         if signal == lost_dir_today:

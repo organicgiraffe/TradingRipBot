@@ -2,7 +2,8 @@ import pandas as pd
 from config import (EMA_PERIODS, MIN_BARS_10M, MIN_BARS_3M,
                     MAX_STOP_DISTANCE, MAX_STOP_PCT,
                     BREAKEVEN_TRIGGER, VOLUME_CONFIRM_MULT,
-                    CLOUD_EXIT_BUFFER, GAP_THRESHOLD)
+                    CLOUD_EXIT_BUFFER,
+                    LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE)
 
 
 # ------------------------------------------------------------------ #
@@ -28,29 +29,6 @@ def compute_emas(bars: list) -> pd.DataFrame:
         df[f"ema{p}"] = df["hl2"].ewm(span=p, adjust=False).mean()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     return df
-
-
-# ------------------------------------------------------------------ #
-# "Taking off" — price bounced off a cloud boundary and closed away
-# ------------------------------------------------------------------ #
-
-def _taking_off(row, direction: str) -> bool:
-    """
-    True when the candle touched a cloud boundary AND closed moving away from it.
-
-    Levels checked (all are cloud edges, not noisy fast EMAs):
-      ema9  — slow edge of Cloud 1 (micro-trend, 8/9)
-      ema12 — slow edge of Cloud 2 (fast cloud,  5/12)
-      ema34 — fast edge of Cloud 3 (slow cloud, 34/50) ← most important
-      ema50 — slow edge of Cloud 3 (stop level)
-
-    Long:  candle low <= level AND close > level  (bounced up through level)
-    Short: candle high >= level AND close < level  (rejected down through level)
-    """
-    levels = [row.ema9, row.ema12, row.ema34, row.ema50]
-    if direction == "long":
-        return any(row.low <= lvl <= row.close for lvl in levels)
-    return any(row.close <= lvl <= row.high for lvl in levels)
 
 
 # ------------------------------------------------------------------ #
@@ -151,218 +129,86 @@ def get_trend_10m(df_10m: pd.DataFrame) -> str:
 # 3-min entry signal
 # ------------------------------------------------------------------ #
 
-def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str,
+def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
                         bar_time=None,
-                        pmh: float = None, pml: float = None) -> tuple[str, float]:
+                        pmh: float = None, pml: float = None,
+                        support: float = None,
+                        resistance: float = None) -> tuple[str, float]:
     """
-    Returns (signal, stop_price).  signal = 'long' | 'short' | 'none'
+    Ripster cloud flip — simple as it gets.
 
-    TYPE 1 — Cloud flip (highest priority)
-      Cloud 2 (5/12) AND Cloud 3 (34/50) both simultaneously flip to the
-      same direction AND hl2 is on the correct side of ema200.
-      Classic "all clouds go green/red at once" setup.
-      For Day1 gap-up/gap-down stocks, allow even at trend=none (see TYPE 1b).
+    LONG  when Cloud 2 (ema5/ema12) flips GREEN  and Cloud 3 (ema34/ema50) is GREEN.
+    SHORT when Cloud 2 (ema5/ema12) flips RED    and Cloud 3 (ema34/ema50) is RED.
 
-    TYPE 1b — Gap continuation (Day1 catalyst plays)
-      Stock opens with ALL clouds already aligned (no flip needed) because it
-      gapped on a news catalyst.  ema50 is >1.5% from price — the slow cloud
-      hasn't caught up.  Entry fires on the first bar(s) above all clouds with
-      volume.  Stop: ema12 (fast cloud slow edge, much tighter than ema50).
-      Requires yesterday's 10-min bars to already confirm the direction.
+    Stop = ema50 (the far edge of the slow cloud — Ripster's defined risk level).
+    If Rip's support / resistance levels are supplied, the tighter of ema50 vs
+    that key level is used as the stop (whichever is closer to entry price).
 
-    TYPE 2 — Taking off from a cloud boundary in an established trend
-      Price touches ema9/ema12/ema34/ema50 and closes away in the trend
-      direction. Fast cloud (5/12) must confirm.
+    Volume must be above average.  No entries before 09:40 ET.
 
-    TYPE 3 — 34/50 cloud reversal: C2 flips ON the reversal candle (fires before TYPE 2)
-      Price dips into the slow cloud (low <= ema34) and closes BACK above it on
-      the same bar, AND the fast cloud (5/12) flips bullish on that exact candle
-      (prev ema5 < ema12, cur ema5 > ema12).  No prior 10-min trend required —
-      the cloud touch + simultaneous C2 flip IS the Ripster reversal signal.
-      Symmetric for shorts: high >= ema34, close < ema34/ema50, C2 flips bear.
-      Volume must be above average to confirm genuine participation.
-      Stop = ema50 (far edge of slow cloud).
-
-    TYPE 4 — Pre-market high / low breakout or continuation  (pmh / pml required)
-      Two sub-cases, both checked after the opening bar:
-
-      4a — Crossing: first regular-session close that moves ABOVE pmh (or BELOW pml).
-        prev.close was on the near side, cur.close is on the far side.
-        Classic intraday "reclaim of the pre-market level" entry.
-        Stop: ema12 — fast cloud slow edge, close to the crossing level.
-
-      4b — Already above/below by gap: price is already >GAP_THRESHOLD (2%) past the
-        pre-market level AND ema12 has also cleared the level (whole fast cloud is
-        on the correct side).  Catches stocks that gap hard through PMH/PML in
-        pre-market and never look back — enter after the opening bar settles.
-        Stop: max(ema12, 2% below entry) — when ema12 hasn't yet caught up after a
-        large pre-market gap the 2% momentum floor prevents a degenerate $10+ wide
-        stop.  Once ema12 rises within 2% of entry it takes over as the mechanical
-        stop automatically.
-
-      Fast cloud must confirm direction.  Volume must be above average.
+    Live-trading note — early entry on volume:
+      Don't wait for the bar to close.  As soon as ema5 crosses ema12 on the
+      live 3-min bar AND volume is already tracking above average mid-candle,
+      that IS the signal.  Enter immediately; every second of delay costs slippage
+      on a momentum move.
     """
     if len(df_3m) < MIN_BARS_3M:
         return "none", 0.0
 
     cur  = df_3m.iloc[-1]
     prev = df_3m.iloc[-2]
-
     entry_price = cur.close
 
-    # Opening-bar gate — no entries at all before 09:40 ET.
-    # The first 1-2 candles capture the gap open and are extremely noisy:
-    # EMAs lag, clouds are distorted, and nearly any signal type fires spuriously.
-    # Rip's own rule: "wait for the open to settle" = let the 09:30-09:39 bars
-    # establish a range before committing.  All entry types are blocked here;
-    # the first tradeable bar is 09:40.
-    is_opening_bar = (bar_time is not None and
-                      bar_time.hour == 9 and bar_time.minute < 40)
-    if is_opening_bar:
+    # No entries in the first 10 minutes — let the open settle
+    if bar_time is not None and bar_time.hour == 9 and bar_time.minute < 40:
         return "none", 0.0
 
-    # --- Volume gate ---
-    vol_above_avg = (cur.vol_ma20 <= 0 or
-                     cur.volume >= VOLUME_CONFIRM_MULT * cur.vol_ma20)
+    # No new entries after 15:00 — not enough time for trade to develop before close
+    if bar_time is not None:
+        if (bar_time.hour > LAST_ENTRY_HOUR or
+                (bar_time.hour == LAST_ENTRY_HOUR
+                 and bar_time.minute >= LAST_ENTRY_MINUTE)):
+            return "none", 0.0
 
-    # --- TYPE 1: simultaneous Cloud 2 + Cloud 3 flip ---
-    cur_all_bull  = cur.ema5  > cur.ema12 and cur.ema34 > cur.ema50
-    prev_all_bull = prev.ema5 > prev.ema12 and prev.ema34 > prev.ema50
-    cur_all_bear  = cur.ema5  < cur.ema12 and cur.ema34 < cur.ema50
-    prev_all_bear = prev.ema5 < prev.ema12 and prev.ema34 < prev.ema50
+    # Volume gate — above-average participation confirms the move is real
+    if cur.vol_ma20 > 0 and cur.volume < VOLUME_CONFIRM_MULT * cur.vol_ma20:
+        return "none", 0.0
 
-    # Gap-up / gap-down detection — Day1 catalyst stocks.
-    # ema50 > GAP_THRESHOLD (2.0%) away from price: slow cloud hasn't caught up.
-    # Use ema12 (fast cloud slow edge) as the tighter stop instead.
-    # These stocks gap on news so the catalyst IS the trend direction signal.
-    is_gap_up   = (cur_all_bull and
-                   (entry_price - cur.ema50) / entry_price > GAP_THRESHOLD)
-    is_gap_down = (cur_all_bear and
-                   (cur.ema50 - entry_price) / entry_price > GAP_THRESHOLD)
+    # Cloud 2 flip: ema5 crosses ema12
+    c2_flip_long  = prev.ema5 <= prev.ema12 and cur.ema5 > cur.ema12
+    c2_flip_short = prev.ema5 >= prev.ema12 and cur.ema5 < cur.ema12
 
-    # TYPE 1 requires established 10-min trend OR a gap-up/down condition.
-    # Non-gap flips at trend=none = morning chop trap (blocked).
-    t1_trend_ok_long  = (trend == "bullish") or is_gap_up
-    t1_trend_ok_short = (trend == "bearish") or is_gap_down
+    # Cloud 3 direction: ema34 vs ema50
+    c3_green = cur.ema34 > cur.ema50
+    c3_red   = cur.ema34 < cur.ema50
 
-    if cur_all_bull and not prev_all_bull and cur.hl2 > cur.ema200 and vol_above_avg and t1_trend_ok_long:
-        stop = cur.ema12 if is_gap_up else compute_stop(df_3m, "long", entry_price)
+    # 10-min trend filter — don't fight the established macro trend.
+    # 'none' means unclear → allow both directions.
+    # 'bullish' → skip shorts.  'bearish' → skip longs.
+    if trend == "bearish" and c2_flip_long:
+        return "none", 0.0
+    if trend == "bullish" and c2_flip_short:
+        return "none", 0.0
+
+    # ---- LONG: C2 just flipped green, C3 is green ----
+    if c2_flip_long and c3_green:
+        stop = cur.ema50
+        # Rip's support level: if it's higher than ema50, use it — tighter and
+        # more meaningful (break of support = trade is wrong)
+        if support is not None and support > stop and support < entry_price:
+            stop = support
         if _stop_ok(entry_price, stop, "long"):
             return "long", stop
 
-    if cur_all_bear and not prev_all_bear and cur.hl2 < cur.ema200 and vol_above_avg and t1_trend_ok_short:
-        stop = cur.ema12 if is_gap_down else compute_stop(df_3m, "short", entry_price)
+    # ---- SHORT: C2 just flipped red, C3 is red ----
+    if c2_flip_short and c3_red:
+        stop = cur.ema50
+        # Rip's resistance level: if it's lower than ema50, use it — tighter
+        # (break back above resistance = trade is wrong)
+        if resistance is not None and resistance < stop and resistance > entry_price:
+            stop = resistance
         if _stop_ok(entry_price, stop, "short"):
             return "short", stop
-
-    # --- TYPE 1b: Gap continuation (both cur AND prev already all-aligned) ---
-    # For stocks that GAP UP on a catalyst and OPEN above all clouds with no flip.
-    # Yesterday's 10-min bars must confirm the direction (trend="bullish"/"bearish").
-    # Stop: ema12 (fast cloud slow edge) — tighter than ema50 on a fresh gap.
-    # Volume gate confirms genuine participation (opening gap bars usually qualify).
-    if (cur_all_bull and prev_all_bull and cur.hl2 > cur.ema200 and
-            vol_above_avg and is_gap_up and trend == "bullish"):
-        stop = cur.ema12
-        if _stop_ok(entry_price, stop, "long"):
-            return "long", stop
-
-    if (cur_all_bear and prev_all_bear and cur.hl2 < cur.ema200 and
-            vol_above_avg and is_gap_down and trend == "bearish"):
-        stop = cur.ema12
-        if _stop_ok(entry_price, stop, "short"):
-            return "short", stop
-
-    # --- TYPE 3: 34/50 cloud reversal — C2 flips ON the reversal candle ---
-    # Long:  low dips into slow cloud (low <= ema34), closes back above it,
-    #        AND fast cloud flips bull on this exact bar (prev c2 bear → cur c2 bull).
-    #        No prior 10-min trend needed; C2 flip + cloud touch = the reversal.
-    # Short: high spikes into slow cloud (high >= ema34), closes back below it,
-    #        AND fast cloud flips bear on this exact bar (prev c2 bull → cur c2 bear).
-    c2_flip_up   = prev.ema5 < prev.ema12 and cur.ema5 > cur.ema12
-    c2_flip_down = prev.ema5 > prev.ema12 and cur.ema5 < cur.ema12
-
-    cloud_bounce_long  = (cur.low  <= cur.ema34 and
-                          cur.close >  cur.ema34 and
-                          cur.close >  cur.ema50 and
-                          c2_flip_up             and
-                          vol_above_avg)
-    cloud_bounce_short = (cur.high >= cur.ema34 and
-                          cur.close <  cur.ema34 and
-                          cur.close <  cur.ema50 and
-                          c2_flip_down           and
-                          vol_above_avg)
-
-    # TYPE 3 guards:
-    #   Require a confirmed 10-min trend in the SAME direction.
-    #   A 3-min reversal bounce with no 10-min backing (trend=none) is more
-    #   likely a dead-cat bounce in choppy midday conditions than a real reversal.
-
-    if cloud_bounce_long and trend == "bullish":
-        stop = compute_stop(df_3m, "long", entry_price)
-        if _stop_ok(entry_price, stop, "long"):
-            return "long", stop
-
-    if cloud_bounce_short and trend == "bearish":
-        stop = compute_stop(df_3m, "short", entry_price)
-        if _stop_ok(entry_price, stop, "short"):
-            return "short", stop
-
-    # --- TYPE 2: taking off from cloud level in an established trend ---
-    # Candle must be GREEN for longs (close > open) and RED for shorts (close < open).
-    # A bar that dips to the cloud but only half-recovers while still closing below its
-    # open is NOT "taking off" — it's a weak bounce that often fails immediately.
-    if trend == "bullish" and _taking_off(cur, "long") and cur.ema5 > cur.ema12 and cur.close > cur.open:
-        stop = compute_stop(df_3m, "long", entry_price)
-        if _stop_ok(entry_price, stop, "long"):
-            return "long", stop
-
-    if trend == "bearish" and _taking_off(cur, "short") and cur.ema5 < cur.ema12 and cur.close < cur.open:
-        stop = compute_stop(df_3m, "short", entry_price)
-        if _stop_ok(entry_price, stop, "short"):
-            return "short", stop
-
-    # --- TYPE 4: pre-market high / low breakout ---
-    # Fires when the regular session first closes ABOVE the pre-market high
-    # (long) or BELOW the pre-market low (short).
-    # The previous bar must have closed on the other side of the level — this
-    # ensures we catch only the crossing candle, not every bar above/below.
-    # Fast cloud (5/12) and volume must confirm.
-    if pmh is not None and pml is not None and pmh > pml:
-        # 4a — crossing PMH/PML for the first time in the regular session
-        pmh_break = (prev.close < pmh and cur.close > pmh and
-                     cur.ema5 > cur.ema12 and vol_above_avg)
-        pml_break = (prev.close > pml and cur.close < pml and
-                     cur.ema5 < cur.ema12 and vol_above_avg)
-
-        # 4b — already above PMH / below PML by a meaningful gap.
-        # ema12 must also be through the level (whole fast cloud cleared it).
-        # Only fires if price is >GAP_THRESHOLD (2%) past the pre-market level
-        # to avoid triggering on stocks that are just grazing the boundary.
-        # 4b — only for LONGS (above PMH).
-        # Gap-up stocks that hold above PMH tend to continue higher (DELL-style).
-        # Gap-DOWN stocks (below PML) almost always see a morning squeeze that
-        # exceeds a 2% stop before any resumption — TYPE 4b short is 0W in all
-        # tested data and structurally unreliable.  Use TYPE 4a for PML breaks.
-        above_pmh = (cur.close  > pmh * (1 + GAP_THRESHOLD) and
-                     cur.ema12  > pmh and
-                     cur.ema5   > cur.ema12 and
-                     cur.close  > prev.close and   # momentum: bar still rising
-                     vol_above_avg)
-
-        if pmh_break or above_pmh:
-            if above_pmh and not pmh_break:
-                # 4b: use 2% momentum floor when ema12 hasn't caught up yet
-                stop = max(cur.ema12, entry_price * (1 - MAX_STOP_PCT * 0.8))
-            else:
-                stop = cur.ema12   # 4a crossing: ema12 is near the level
-            if _stop_ok(entry_price, stop, "long"):
-                return "long", stop
-
-        if pml_break:
-            # TYPE 4a only for shorts — first crossing below PML
-            stop = cur.ema12
-            if _stop_ok(entry_price, stop, "short"):
-                return "short", stop
 
     return "none", 0.0
 
