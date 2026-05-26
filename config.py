@@ -47,6 +47,8 @@ PROFIT_TARGET_SHARE  = 5.00   # exit at +$5/share = $500 profit on 100 shares
 MIN_DAILY_RANGE      = 7.00   # skip stock if 5-day avg daily range < $7
                                # TSLA/AMD/META/CRWD pass; AAPL/AMZN/NFLX typically fail
 MIN_STOP_DIST        = 0.40   # absolute floor (legacy) — superseded by MIN_STOP_PCT_LOWER below
+LARGE_CANDLE_STOP    = 5.00   # prev candle range > this → use entry ± range/2 as stop
+                               # prevents oversized risk on gap/news bars ($5 threshold)
 MIN_STOP_PCT_LOWER   = 0.0025 # 0.25% of price — stops tighter than this are noise, not signal
                               # META $605 + $0.68 stop = 0.11% → blocked
                               # AMZN $264 + $0.97 stop = 0.37% → allowed

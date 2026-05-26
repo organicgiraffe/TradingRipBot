@@ -8,7 +8,8 @@ from config import (EMA_PERIODS, MIN_BARS_10M, MIN_BARS_3M,
                     LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE,
                     FRIDAY_OPEN_MINUTE,
                     RVOL_EXIT_MULT,
-                    ATR_PERIODS, DTR_MAX_PCT)
+                    ATR_PERIODS, DTR_MAX_PCT,
+                    LARGE_CANDLE_STOP)
 
 
 # ------------------------------------------------------------------ #
@@ -103,6 +104,39 @@ def compute_dtr_atr_ratio(df_10m: pd.DataFrame, target_date,
 
 
 # ------------------------------------------------------------------ #
+# Candle-pattern helpers — used by entry filters and test suite
+# ------------------------------------------------------------------ #
+
+def is_hammer(row) -> bool:
+    """Bullish reversal: small body, long lower wick (>=2x body), tiny upper wick."""
+    body        = abs(row.close - row.open)
+    if body <= 0:
+        return False
+    upper_wick  = row.high - max(row.close, row.open)
+    lower_wick  = min(row.close, row.open) - row.low
+    return lower_wick >= 2 * body and upper_wick <= body
+
+
+def is_shooting_star(row) -> bool:
+    """Bearish reversal: small body, long upper wick (>=2x body), tiny lower wick."""
+    body        = abs(row.close - row.open)
+    if body <= 0:
+        return False
+    upper_wick  = row.high - max(row.close, row.open)
+    lower_wick  = min(row.close, row.open) - row.low
+    return upper_wick >= 2 * body and lower_wick <= body
+
+
+def is_doji(row) -> bool:
+    """Indecision candle: body is <= 15% of the full high-low range."""
+    candle_range = row.high - row.low
+    if candle_range <= 0:
+        return True
+    body = abs(row.close - row.open)
+    return (body / candle_range) <= 0.15
+
+
+# ------------------------------------------------------------------ #
 # Stop quality gate — percentage-based so it works across all price levels
 # ------------------------------------------------------------------ #
 
@@ -129,13 +163,27 @@ def _stop_ok(entry_price: float, stop_price: float, direction: str) -> bool:
 
 def compute_stop(df_3m: pd.DataFrame, direction: str, entry_price: float) -> float:
     """
-    Stop = ema50 (the far edge of the slow 34/50 cloud).
+    Stop based on the previous bar's range.
 
-    Bullish: ema34 > ema50  → ema50 is BELOW price  → long stop
-    Bearish: ema34 < ema50  → ema50 is ABOVE price  → short stop
+    Normal candle (range <= LARGE_CANDLE_STOP):
+      long  → prev.low   (break below prior bar = trade is wrong)
+      short → prev.high  (break above prior bar = trade is wrong)
+
+    Large candle (range > LARGE_CANDLE_STOP — gap/news bar):
+      long  → entry - range/2   (using full prev.low would risk too much)
+      short → entry + range/2
     """
-    cur = df_3m.iloc[-1]
-    return cur.ema50
+    if len(df_3m) < 2:
+        return df_3m.iloc[-1].ema50
+    prev       = df_3m.iloc[-2]
+    prev_range = prev.high - prev.low
+    if prev_range > LARGE_CANDLE_STOP:
+        if direction == "long":
+            return entry_price - prev_range / 2
+        return entry_price + prev_range / 2
+    if direction == "long":
+        return prev.low
+    return prev.high
 
 
 # ------------------------------------------------------------------ #
