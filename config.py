@@ -33,8 +33,8 @@ RATCHET_GIVEBACK     = 2.0    # max $ that can be given back once ratchet is act
 MAX_STOP_PCT         = 0.025  # skip trade if stop is farther than 2.5% of entry price
 MAX_STOP_DISTANCE    = 5.00   # legacy dollar cap — now secondary to MAX_STOP_PCT
 MAX_TRADES_PER_DAY   = 1      # one clean trade per symbol per day; second trades are consistent losers
-VOLUME_CONFIRM_MULT  = 1.2    # signal candle volume must be > 1.2x 20-bar avg
-RVOL_EXIT_MULT       = 0.5    # exit when 3m bar volume drops below 50% of avg — momentum gone
+VOLUME_CONFIRM_MULT  = 0.8    # signal candle volume must be > 0.8x 20-bar avg (80% of average)
+RVOL_EXIT_MULT       = 0.3    # exit when 3m bar volume drops below 30% of avg — truly dead
 MAX_RISK_PER_TRADE   = 200.0  # max $ at risk per trade — shares are sized dynamically
 MIN_SHARES           = 1      # never go below 1 share
 
@@ -75,3 +75,6 @@ LEVEL_PROX_SHORT = 0.020   # 2.0% below support    = max allowed for a short ent
 # Example: if ATR = $7.59 and DTR so far = $6.21, ratio = 82% — skip the trade.
 ATR_PERIODS  = 14     # trading days for ATR lookback
 DTR_MAX_PCT  = 0.75   # skip entry when DTR >= 75% of ATR (move is largely done)
+
+# ── Debug output ──────────────────────────────────────────────────────────────
+DEBUG_SIGNALS = True   # print a status line every 3m bar + BLOCKED reasons

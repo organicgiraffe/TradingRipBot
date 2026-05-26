@@ -14,21 +14,23 @@ All entry/exit logic mirrors week_backtest.py exactly:
   - 10-min fast cloud exit
   - 1 trade per symbol per direction per day after a loss
 """
-import asyncio
 import logging
 import os
 from datetime import datetime, date
 from typing import Optional
 
 import pandas as pd
-from ib_insync import IB, Stock, MarketOrder
+from ib_insync import IB, Stock, MarketOrder, Order
 
 from config import (TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
                     BAR_SIZE_10M, BAR_SIZE_3M,
-                    MAX_TRADES_PER_DAY, MAX_SIMULTANEOUS_POSITIONS,
+                    MAX_SIMULTANEOUS_POSITIONS,
                     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
                     MAX_RISK_DOLLARS, LEVEL_PROX_LONG, LEVEL_PROX_SHORT,
-                    DTR_MAX_PCT)
+                    DTR_MAX_PCT, FIRST_ENTRY_MINUTE, MARKET_OPEN_HOUR,
+                    MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
+                    VOLUME_CONFIRM_MULT, DEBUG_SIGNALS,
+                    PROFIT_TARGET_SHARE)
 from ema_engine import (compute_emas, get_trend_10m,
                         get_entry_signal_3m, should_exit_10m,
                         should_exit_rvol, compute_trailing_stop,
@@ -64,6 +66,21 @@ def _setup_trade_logger(log_dir: str = "logs") -> logging.Logger:
 tlog = _setup_trade_logger()
 
 
+def _entry_order(action: str, quantity: int) -> Order:
+    """Entry order — Midprice on live (fills at bid/ask midpoint, saves spread),
+    plain MarketOrder on paper (Midprice not needed in simulation).
+    Exits always use MarketOrder so they are guaranteed to fill."""
+    if TWS_PORT == 7496:   # live account
+        o = Order()
+        o.action        = action
+        o.totalQuantity = quantity
+        o.orderType     = "MIDPRICE"
+        o.tif           = "DAY"
+        return o
+    else:                  # paper account (7497) — market order
+        return MarketOrder(action, quantity)
+
+
 class TradingBot:
     def __init__(self, symbols: list[str], plan: dict):
         """
@@ -86,6 +103,11 @@ class TradingBot:
         self._lost_dir_today: dict = {s: None for s in self.symbols}
         self._last_trade_date      = None
 
+        # Protective STP orders placed in TWS at entry — crash backstop.
+        # If the bot crashes mid-trade, TWS closes the position at the initial stop.
+        # Cancelled automatically when bot exits the position normally.
+        self._twss_stop_orders: dict = {}  # symbol -> ib_insync Order object
+
         # Pre-market high / low per symbol — used for PMH/PML breakout signals
         self.pmh: dict = {s: None for s in self.symbols}
         self.pml: dict = {s: None for s in self.symbols}
@@ -94,8 +116,8 @@ class TradingBot:
     # Connection
     # ──────────────────────────────────────────────────────────────────────
 
-    async def connect(self):
-        await self.ib.connectAsync(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID)
+    def connect(self):
+        self.ib.connect(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID)
         log.info("Connected to IBKR TWS  (port %s)", TWS_PORT)
 
     def disconnect(self):
@@ -106,38 +128,73 @@ class TradingBot:
     # Bar subscriptions
     # ──────────────────────────────────────────────────────────────────────
 
-    async def subscribe_bars(self):
+    def subscribe_bars(self):
+        """Initial historical data load (keepUpToDate=False).
+        Live updates come from _refresh_bars() called on a schedule in run().
+        keepUpToDate=True is unreliable on Windows with ib.sleep() — bars freeze.
+        """
         for symbol in self.symbols:
             contract = Stock(symbol, "SMART", "USD")
             self.ib.qualifyContracts(contract)
             self.trend[symbol] = "none"
 
             b10 = self.ib.reqHistoricalData(
-                contract, endDateTime="", durationStr="3 D",
+                contract, endDateTime="", durationStr="20 D",
                 barSizeSetting=BAR_SIZE_10M, whatToShow="TRADES",
-                useRTH=True, keepUpToDate=True,
+                useRTH=True, keepUpToDate=False,
             )
             self.bars_10m[symbol] = b10
-            b10.updateEvent += self._make_handler(symbol, "10m")
+            self._on_new_bar_10m(symbol, b10)   # set initial trend
 
             b3 = self.ib.reqHistoricalData(
                 contract, endDateTime="", durationStr="3 D",
                 barSizeSetting=BAR_SIZE_3M, whatToShow="TRADES",
-                useRTH=True, keepUpToDate=True,
+                useRTH=True, keepUpToDate=False,
             )
             self.bars_3m[symbol] = b3
-            b3.updateEvent += self._make_handler(symbol, "3m")
 
-            log.info(f"  {symbol}: {len(b10)} x 10-min  |  {len(b3)} x 3-min bars loaded")
+            log.info(f"  {symbol}: {len(b10)} x 10-min  |  {len(b3)} x 3-min bars loaded  trend={self.trend[symbol]}")
 
-    def _make_handler(self, symbol: str, tf: str):
-        def on_bar(bars, has_new_bar):
-            if has_new_bar:
-                if tf == "10m":
-                    self._on_new_bar_10m(symbol, bars)
-                else:
-                    self._on_new_bar_3m(symbol, bars)
-        return on_bar
+    # ──────────────────────────────────────────────────────────────────────
+    # Bar refresh — re-request fresh data at each bar boundary
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _refresh_bars(self, refresh_10m: bool = False):
+        """Re-request historical bars for all symbols.
+        Called every 3-min bar close for 3m bars, and every 10-min bar close
+        for 10m bars.  Each request is a fresh snapshot (keepUpToDate=False).
+        """
+        for symbol in self.symbols:
+            try:
+                contract = Stock(symbol, "SMART", "USD")
+                self.ib.qualifyContracts(contract)
+
+                # ── 3-min bars ───────────────────────────────────────────
+                new_b3 = self.ib.reqHistoricalData(
+                    contract, endDateTime="", durationStr="3 D",
+                    barSizeSetting=BAR_SIZE_3M, whatToShow="TRADES",
+                    useRTH=True, keepUpToDate=False,
+                )
+                if new_b3:
+                    old_date = self.bars_3m[symbol][-1].date if self.bars_3m.get(symbol) else None
+                    self.bars_3m[symbol] = new_b3
+                    if new_b3[-1].date != old_date:
+                        log.info(f"  {symbol}: new 3m bar at {new_b3[-1].date}  close={new_b3[-1].close:.2f}")
+                        self._on_new_bar_3m(symbol, new_b3)
+
+                # ── 10-min bars (only when requested) ────────────────────
+                if refresh_10m:
+                    new_b10 = self.ib.reqHistoricalData(
+                        contract, endDateTime="", durationStr="20 D",
+                        barSizeSetting=BAR_SIZE_10M, whatToShow="TRADES",
+                        useRTH=True, keepUpToDate=False,
+                    )
+                    if new_b10:
+                        self.bars_10m[symbol] = new_b10
+                        self._on_new_bar_10m(symbol, new_b10)
+
+            except Exception as e:
+                log.warning(f"  {symbol}: bar refresh error — {e}")
 
     # ──────────────────────────────────────────────────────────────────────
     # Pre-market levels  (call once before 09:30 ET each morning)
@@ -196,6 +253,7 @@ class TradingBot:
     # ──────────────────────────────────────────────────────────────────────
 
     def _on_new_bar_3m(self, symbol: str, bars):
+        print(f"  BAR {symbol} {len(bars)} bars", flush=True)
         df_3m  = compute_emas(list(bars))
         df_10m = compute_emas(list(self.bars_10m[symbol]))
         now    = datetime.now()
@@ -215,6 +273,21 @@ class TradingBot:
         pos = self.positions.get(symbol)
         if pos and pos.is_open:
 
+            # ── End-of-day forced close ───────────────────────────────────
+            # Close any open position at or after MARKET_CLOSE_MINUTE.
+            # MARKET_CLOSE_MINUTE = 50 → forces exit by 15:50 ET.
+            # Change to 59 in config if you want to hold until 15:59.
+            # This fires on the first 3m bar that closes AT or AFTER that minute.
+            if (now.hour > MARKET_CLOSE_HOUR or
+                    (now.hour == MARKET_CLOSE_HOUR
+                     and now.minute >= MARKET_CLOSE_MINUTE)):
+                tlog.warning(
+                    f"EOD    forced close  {symbol}  {now.strftime('%H:%M')}"
+                    f"  px=${cur.close:.2f}"
+                )
+                self._close_position(symbol, cur.close, now, "eod_close")
+                return
+
             # Compute unrealised P&L BEFORE updating the ratchet stop.
             # HWM is updated AFTER the stop check — prevents the intrabar phantom:
             # the same bar that raises the ratchet floor cannot immediately hit it.
@@ -229,13 +302,20 @@ class TradingBot:
             # Live P&L printed every bar while in the trade
             self._print_live_pnl(symbol, cur, now)
 
-            # ── Half-exit at Rip's level ──────────────────────────────────
-            # Exit 50% of shares when price reaches the target level.
-            # Locks partial profit; remaining shares run with the ratchet stop.
-            # Fires at most once per position (half_exited flag).
+            # ── Half-exit: Rip's level  OR  flat profit target ────────────
+            # Takes 50% of shares off when the first of these triggers fires:
+            #   1. Rip's level (resistance for longs, support for shorts)
+            #      — checked every bar; level may not be hit until bars later.
+            #   2. Profit target (+$5/share) when no Rip level is configured
+            #      — rules-only fallback so every trade has a defined exit point.
+            # Once either trigger fires, half_exited=True prevents re-firing.
+            # Remaining shares are managed by the ratchet trailing stop only.
             if not pos.half_exited:
-                half_sh = pos.shares // 2
-                half_px = None
+                half_sh  = pos.shares // 2
+                half_px  = None
+                half_rsn = "half@level"
+
+                # Priority 1: Rip's key level — re-evaluated every bar
                 if (pos.direction == "long" and pos.level_res is not None
                         and cur.high >= pos.level_res):
                     half_px = pos.level_res
@@ -243,16 +323,24 @@ class TradingBot:
                         and cur.low <= pos.level_sup):
                     half_px = pos.level_sup
 
+                # Priority 2: Flat profit target — only when no level configured
+                has_level = (pos.level_res is not None if pos.direction == "long"
+                             else pos.level_sup is not None)
+                if half_px is None and not has_level and unrealised >= PROFIT_TARGET_SHARE:
+                    half_px  = cur.close
+                    half_rsn = "half@target"
+
                 if half_px is not None and half_sh > 0:
                     half_pnl = ((half_px - pos.entry_price) * half_sh
                                 if pos.direction == "long"
                                 else (pos.entry_price - half_px) * half_sh)
                     if half_pnl > 0:
-                        self._close_partial(symbol, half_sh, half_px, now)
+                        self._close_partial(symbol, half_sh, half_px, now,
+                                            reason=half_rsn)
                         pos.shares -= half_sh
-                pos.half_exited = True   # prevent re-firing even if pnl was 0
+                    pos.half_exited = True  # don't fire again (even if pnl was 0)
 
-            # Update HWM after stop check (intrabar-safe)
+            # Update HWM after the half-exit check (intrabar-safe)
             pos.best_unrealised = max(pos.best_unrealised, unrealised)
 
             # ── Hard stop hit ─────────────────────────────────────────────
@@ -270,24 +358,33 @@ class TradingBot:
                 return
 
             # ── RVOL exit — momentum dried up ────────────────────────────
-            # Suppress once the ratchet has locked in profit (let stop manage it)
+            # Require BOTH low volume AND C2 flipped against position.
+            # Low volume alone doesn't mean the move is over — if C2 still
+            # aligned (ema5 above ema12 for longs), stay in; let ratchet manage.
+            # Suppress entirely once ratchet has locked profit.
             stop_locked = (pos.stop_price > pos.entry_price if pos.direction == "long"
                            else pos.stop_price < pos.entry_price)
-            if should_exit_rvol(df_3m) and not stop_locked:
-                self._close_position(symbol, cur.close, now, "low rvol")
+            c2_against  = (cur.ema5 < cur.ema12 if pos.direction == "long"
+                           else cur.ema5 > cur.ema12)
+            if should_exit_rvol(df_3m) and not stop_locked and c2_against:
+                self._close_position(symbol, cur.close, now, "low rvol+C2")
             return
 
         # ─────────────────────────────────────────────────────────────────
         # ENTRY CHECKS
         # ─────────────────────────────────────────────────────────────────
-        if self._trades_today[symbol] >= MAX_TRADES_PER_DAY:
-            return
         if len(self.positions) >= MAX_SIMULTANEOUS_POSITIONS:
+            return
+
+        # Time gate — match backtest: no entries before FIRST_ENTRY_MINUTE
+        if now.hour == MARKET_OPEN_HOUR and now.minute < FIRST_ENTRY_MINUTE:
             return
 
         # DTR/ATR exhaustion gate — skip when daily range is >= 75% of ATR
         dtr_ratio = compute_dtr_atr_ratio(df_10m, today, bar_time=now)
         if dtr_ratio > DTR_MAX_PCT:
+            if DEBUG_SIGNALS:
+                print(f"  {now.strftime('%H:%M')}  {symbol:6s}  SKIP: DTR {dtr_ratio:.0%} of ATR")
             return
 
         # Rip's levels for this symbol (None = rules-only, no filter applied)
@@ -296,14 +393,67 @@ class TradingBot:
         res = plan_entry.get("resistance")
 
         trend = self.trend.get(symbol, "none")
+
+        # ── Debug: cloud state + key values every bar ────────────────────
+        if DEBUG_SIGNALS:
+            _c = df_3m.iloc[-1]
+            _p = df_3m.iloc[-2] if len(df_3m) >= 2 else _c
+            _flip_l = _p.ema5 <= _p.ema12 and _c.ema5 > _c.ema12
+            _flip_s = _p.ema5 >= _p.ema12 and _c.ema5 < _c.ema12
+            _c2 = "GRN" if _c.ema5 > _c.ema12 else "RED"
+            _c3 = "GRN" if _c.ema34 > _c.ema50 else "RED"
+            _vol_ok = _c.vol_ma20 <= 0 or _c.volume >= VOLUME_CONFIRM_MULT * _c.vol_ma20
+            _tag = " <<FLIP!" if (_flip_l or _flip_s) else ""
+            print(
+                f"  {now.strftime('%H:%M')}  {symbol:6s}"
+                f"  C2:{_c2} C3:{_c3}{_tag}"
+                f"  trend={trend:8s}"
+                f"  vol={'OK ' if _vol_ok else 'LOW'}"
+                f"  DTR={dtr_ratio:.0%}"
+                f"  e5={_c.ema5:.2f} e12={_c.ema12:.2f} e50={_c.ema50:.2f}"
+                f"  px={_c.close:.2f}"
+            )
+
         signal, stop_price, entry_reason = get_entry_signal_3m(
             df_3m, trend, bar_time=now,
             pmh=self.pmh.get(symbol), pml=self.pml.get(symbol),
             support=sup, resistance=res)
 
         if signal == "none":
+            # ── Explain what blocked a flip (only interesting bars) ───────
+            if DEBUG_SIGNALS:
+                _c = df_3m.iloc[-1]
+                _p = df_3m.iloc[-2] if len(df_3m) >= 2 else _c
+                _flip_l = _p.ema5 <= _p.ema12 and _c.ema5 > _c.ema12
+                _flip_s = _p.ema5 >= _p.ema12 and _c.ema5 < _c.ema12
+                if _flip_l or _flip_s:
+                    _dir = "LONG" if _flip_l else "SHORT"
+                    # Collect ALL reasons — multiple can block simultaneously
+                    _reasons = []
+                    # 10m direction confirmed and opposes the flip
+                    if trend == "bearish" and _flip_l:
+                        _reasons.append("10m=bearish")
+                    elif trend == "bullish" and _flip_s:
+                        _reasons.append("10m=bullish")
+                    # C3 cloud direction must match signal direction
+                    # (when trend=none, this is the only bias filter)
+                    if _flip_l and _c.ema34 < _c.ema50:
+                        _reasons.append("C3 red (need green for long)")
+                    if _flip_s and _c.ema34 > _c.ema50:
+                        _reasons.append("C3 green (need red for short)")
+                    # Volume confirmation
+                    if _c.vol_ma20 > 0 and _c.volume < VOLUME_CONFIRM_MULT * _c.vol_ma20:
+                        _reasons.append(f"vol {_c.volume:.0f}<{VOLUME_CONFIRM_MULT * _c.vol_ma20:.0f}")
+                    if not _reasons:
+                        _reasons.append("stop/level filter")
+                    tlog.info(
+                        f"BLOCKED  {symbol}  {_dir}  [{' | '.join(_reasons)}]"
+                        f"  px=${_c.close:.2f}  e50=${_c.ema50:.2f}"
+                    )
             return
         if signal == self._lost_dir_today.get(symbol):
+            if DEBUG_SIGNALS:
+                tlog.info(f"BLOCKED  {symbol}  {signal.upper()}  [lost same direction today]")
             return   # blocked after same-direction loss today
 
         entry_price = cur.close
@@ -385,7 +535,7 @@ class TradingBot:
         action   = "BUY" if direction == "long" else "SELL"
         contract = Stock(symbol, "SMART", "USD")
         self.ib.qualifyContracts(contract)
-        order = self.ib.placeOrder(contract, MarketOrder(action, shares))
+        order = self.ib.placeOrder(contract, _entry_order(action, shares))
 
         pos = Position(
             symbol=symbol, direction=direction, shares=shares,
@@ -398,14 +548,47 @@ class TradingBot:
         log.info(f"  ORDER: {action} {shares}x {symbol}  "
                  f"(order #{order.order.orderId}  ~${entry_price:.2f})")
 
+        # Place a protective STP order in TWS as a crash backstop.
+        # If the bot crashes while in a trade, TWS closes the position at
+        # the initial stop — preventing an unmanaged open position overnight.
+        # The bot cancels this order automatically on any normal exit.
+        _crash_action = "SELL" if direction == "long" else "BUY"
+        _stop_ord = Order()
+        _stop_ord.action        = _crash_action
+        _stop_ord.totalQuantity = shares
+        _stop_ord.orderType     = "STP"
+        _stop_ord.auxPrice      = round(stop_price, 2)
+        _stop_ord.tif           = "DAY"
+        try:
+            _stop_trade = self.ib.placeOrder(contract, _stop_ord)
+            self._twss_stop_orders[symbol] = _stop_trade.order
+            log.info(f"  CRASH STOP: {_crash_action} {shares}x {symbol}  "
+                     f"STP@${stop_price:.2f}  (order #{_stop_trade.order.orderId})")
+        except Exception as _e:
+            log.warning(f"  {symbol}: crash stop placement failed — {_e}")
+
     def _close_partial(self, symbol: str, shares: int,
-                       price: float, time: datetime):
-        """Place a partial exit order (half-exit at Rip's level)."""
+                       price: float, time: datetime,
+                       reason: str = "half@level"):
+        """Place a partial exit order (half at Rip's level or profit target)."""
         pos    = self.positions[symbol]
         action = "SELL" if pos.direction == "long" else "BUY"
         contract = Stock(symbol, "SMART", "USD")
         self.ib.qualifyContracts(contract)
         self.ib.placeOrder(contract, MarketOrder(action, shares))
+
+        # Keep crash-stop quantity in sync with remaining shares.
+        # Without this, the crash stop would try to sell the full original
+        # quantity if the bot crashed after a half-exit — creating a short.
+        _remaining = pos.shares - shares
+        _crash_stp = self._twss_stop_orders.get(symbol)
+        if _crash_stp is not None and _remaining > 0:
+            _crash_stp.totalQuantity = _remaining
+            try:
+                self.ib.placeOrder(contract, _crash_stp)   # sends modify to TWS
+                log.info(f"  CRASH STOP adjusted: {symbol}  qty={_remaining}sh")
+            except Exception as _e:
+                log.warning(f"  {symbol}: crash stop qty adjust failed — {_e}")
 
         half_pnl = ((price - pos.entry_price) * shares if pos.direction == "long"
                     else (pos.entry_price - price) * shares)
@@ -413,18 +596,18 @@ class TradingBot:
         tlog.info(
             f"HALF   {pos.direction.upper():<5}  {symbol}  x{shares}sh  "
             f"${pos.entry_price:.2f}->${price:.2f}  pnl={sign}${half_pnl:.0f}  "
-            f"[half@level]  remaining={pos.shares - shares}sh"
+            f"[{reason}]  remaining={_remaining}sh"
         )
         self.trade_log.append({
             "time":         time.strftime("%H:%M:%S"),
-            "event":        "half@level",
+            "event":        reason,   # "half@level" or "half@target"
             "symbol":       symbol,
             "direction":    pos.direction,
             "entry":        pos.entry_price,
             "exit":         price,
             "shares":       shares,
             "pnl":          half_pnl,
-            "reason":       "half@level",
+            "reason":       reason,
             "entry_signal": pos.entry_signal,
         })
 
@@ -452,10 +635,12 @@ class TradingBot:
         )
 
         self._trades_today[symbol] += 1
-        if pnl < 0:
+        # Only block re-entries after a meaningful loss — scratches ($50 or less)
+        # are often premature exits, not wrong direction calls.
+        if pnl < -50:
             self._lost_dir_today[symbol] = pos.direction
             tlog.info(
-                f"  BLOCK  {symbol}  {pos.direction.upper()} re-entries today (loss)"
+                f"  BLOCK  {symbol}  {pos.direction.upper()} re-entries today (loss ${pnl:.0f})"
             )
 
         self.trade_log.append({
@@ -471,22 +656,62 @@ class TradingBot:
             "entry_signal": pos.entry_signal,
             "held_min":     dur,
         })
+
+        # Cancel the TWS crash-backstop stop order.
+        # Position is now flat — the standing STP order would try to sell
+        # into nothing if price drifts down to it.  Cancel it cleanly.
+        _twss = self._twss_stop_orders.pop(symbol, None)
+        if _twss is not None:
+            try:
+                self.ib.cancelOrder(_twss)
+                log.info(f"  CRASH STOP CANCELLED: {symbol}  (order #{_twss.orderId})")
+            except Exception as _e:
+                log.warning(f"  {symbol}: crash stop cancel failed — {_e}")
+
         del self.positions[symbol]
 
     # ──────────────────────────────────────────────────────────────────────
     # Run
     # ──────────────────────────────────────────────────────────────────────
 
-    async def run(self):
-        await self.connect()
-        await self.subscribe_bars()
+    def run(self):
+        self.connect()
+        self.subscribe_bars()
 
         tlog.info("BOT LIVE  symbols=" + ", ".join(self.symbols))
+        tlog.info(f"  entry gate: 09:{FIRST_ENTRY_MINUTE:02d} ET | "
+                  f"max_pos={MAX_SIMULTANEOUS_POSITIONS} | "
+                  f"risk_cap=${MAX_RISK_DOLLARS} | "
+                  f"DTR_max={DTR_MAX_PCT:.0%} | "
+                  f"debug={'ON' if DEBUG_SIGNALS else 'OFF'}")
         for sym in self.symbols:
             p = self.plan.get(sym, {})
             tlog.info(f"  {sym:6s}  sup={p.get('support')}  res={p.get('resistance')}")
 
-        await asyncio.sleep(float("inf"))
+        # Scheduled refresh loop.
+        # keepUpToDate=True freezes on Windows with ib.sleep() — instead we
+        # re-request fresh bars at each bar-close boundary:
+        #   3-min bars : minute divisible by 3  (9:33, 9:36, ..., 15:57)
+        #   10-min bars: minute divisible by 10 (9:40, 9:50, 10:00, ...)
+        last_3m_id  = -1   # bar-close ID already processed for 3m
+        last_10m_id = -1   # bar-close ID already processed for 10m
+
+        while True:
+            self.ib.sleep(1)
+
+            if not self.ib.isConnected():
+                log.warning("TWS disconnected — stopping.")
+                break
+
+            now = datetime.now()
+
+            # ── 3-min bar close detector ──────────────────────────────────
+            # Bars close when clock-minute is divisible by 3, within first 5s
+            bar_3m_id = now.hour * 100 + now.minute
+            if now.minute % 3 == 0 and now.second <= 5 and bar_3m_id != last_3m_id:
+                last_3m_id = bar_3m_id
+                log.info(f"  Bar close {now.strftime('%H:%M')} — refreshing bars")
+                self._refresh_bars(refresh_10m=True)   # always update trend
 
     # ──────────────────────────────────────────────────────────────────────
     # Session summary

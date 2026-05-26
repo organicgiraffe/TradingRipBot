@@ -13,18 +13,16 @@ Pre-requisites:
          - Read-Only API: OFF  (bot needs to place orders)
     3. Python packages: ib_insync, pandas, yfinance
 """
-import asyncio
 import logging
 import os
 import signal
 import sys
 from datetime import date
 
-from ib_insync import util
-
 from config import (FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
                     MAX_RISK_DOLLARS, FIRST_ENTRY_MINUTE, MAX_SIMULTANEOUS_POSITIONS)
 from ibkr_client import TradingBot
+from post_session_analyzer import analyze_session
 
 # ── Logging: console + bot activity log ───────────────────────────────────
 os.makedirs("logs", exist_ok=True)
@@ -97,13 +95,9 @@ def get_startup_inputs() -> tuple[list[str], dict]:
     return symbols, plan
 
 
-async def main():
-    util.startLoop()   # ib_insync event loop integration
-
+def main():
     symbols, plan = get_startup_inputs()
     bot = TradingBot(symbols, plan)
-
-    loop = asyncio.get_event_loop()
 
     def shutdown(sig, frame):
         log.info("Shutdown signal received — stopping bot...")
@@ -115,13 +109,14 @@ async def main():
                 )
         bot.print_session_summary()
         bot.disconnect()
-        loop.stop()
+        analyze_session()   # replay blocked signals, score filters, write report
+        sys.exit(0)
 
     signal.signal(signal.SIGINT,  shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
     try:
-        await bot.run()
+        bot.run()   # connects, subscribes, then blocks in ib.run()
     except Exception as e:
         log.error(f"Bot crashed: {e}", exc_info=True)
         bot.print_session_summary()
@@ -129,4 +124,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

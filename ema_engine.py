@@ -83,8 +83,14 @@ def compute_dtr_atr_ratio(df_10m: pd.DataFrame, target_date,
 
     # DTR: today's range so far (up to bar_time, or full day if None)
     if bar_time is not None:
+        # IBKR returns tz-aware timestamps; datetime.now() is naive — align them.
+        bt = pd.Timestamp(bar_time)
+        if df_10m.index.tz is not None and bt.tzinfo is None:
+            bt = bt.tz_localize(df_10m.index.tz)
+        elif df_10m.index.tz is None and bt.tzinfo is not None:
+            bt = bt.tz_localize(None)
         today_bars = df_10m[
-            (df_10m.index.date == target_date) & (df_10m.index <= bar_time)
+            (df_10m.index.date == target_date) & (df_10m.index <= bt)
         ]
     else:
         today_bars = df_10m[df_10m.index.date == target_date]
@@ -261,28 +267,54 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
     if cur.vol_ma20 > 0 and cur.volume < VOLUME_CONFIRM_MULT * cur.vol_ma20:
         return "none", 0.0, ""
 
-    # Trend gate — 10m must show a clear direction.
-    # When trend is 'none', both clouds are mixed or price is straddling ema200.
-    # C2 flips in that environment are noise — skip everything.
-    if trend == "none":
-        return "none", 0.0, ""
-
     # Cloud 2 flip: ema5 crosses ema12
+    # Grace window: also fire on the 1-2 bars immediately after a flip while
+    # C2 is still aligned — catches cases where the flip bar had low volume
+    # but volume confirmed on the next bar.
     c2_flip_long  = prev.ema5 <= prev.ema12 and cur.ema5 > cur.ema12
     c2_flip_short = prev.ema5 >= prev.ema12 and cur.ema5 < cur.ema12
+
+    flip_late = False   # True when entry fires on bar +1 or +2 after the flip
+    if not c2_flip_long and cur.ema5 > cur.ema12 and len(df_3m) >= 4:
+        p2 = df_3m.iloc[-3]
+        p3 = df_3m.iloc[-4]
+        # 1 bar ago was the flip (prev=green, p2=red)
+        if prev.ema5 > prev.ema12 and p2.ema5 <= p2.ema12:
+            c2_flip_long = True
+            flip_late = True
+        # 2 bars ago was the flip (p2=green, p3=red)
+        elif prev.ema5 > prev.ema12 and p2.ema5 > p2.ema12 and p3.ema5 <= p3.ema12:
+            c2_flip_long = True
+            flip_late = True
+
+    if not c2_flip_short and cur.ema5 < cur.ema12 and len(df_3m) >= 4:
+        p2 = df_3m.iloc[-3]
+        p3 = df_3m.iloc[-4]
+        if prev.ema5 < prev.ema12 and p2.ema5 >= p2.ema12:
+            c2_flip_short = True
+            flip_late = True
+        elif prev.ema5 < prev.ema12 and p2.ema5 < p2.ema12 and p3.ema5 >= p3.ema12:
+            c2_flip_short = True
+            flip_late = True
 
     # Cloud 3 direction: ema34 vs ema50
     c3_green = cur.ema34 > cur.ema50
     c3_red   = cur.ema34 < cur.ema50
 
-    # 10-min trend filter — don't fight the established macro trend.
+    # 10-min trend filter — when confirmed, don't fight the macro trend.
+    # When trend == 'none' (10m not yet aligned), C3 on 3m acts as the bias
+    # filter instead — C2 flip must still agree with C3 direction.
     # 'bullish' → skip shorts.  'bearish' → skip longs.
     if trend == "bearish" and c2_flip_long:
         return "none", 0.0, ""
     if trend == "bullish" and c2_flip_short:
         return "none", 0.0, ""
 
-    # ---- LONG: C2 just flipped green, C3 is green ----
+    # Scalp mode: 10m not yet confirmed → C3 on 3m is the only bias filter.
+    # Label these entries differently so performance can be tracked separately.
+    scalp_mode = (trend == "none")
+
+    # ---- LONG: C2 just flipped green (or within grace window), C3 is green ----
     if c2_flip_long and c3_green:
         stop = cur.ema50
         # Rip's support level: if it's higher than ema50, use it — tighter and
@@ -290,9 +322,13 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if support is not None and support > stop and support < entry_price:
             stop = support
         if _stop_ok(entry_price, stop, "long"):
-            return "long", stop, "cloud_flip"
+            if scalp_mode:
+                reason = "c3_scalp+1" if flip_late else "c3_scalp"
+            else:
+                reason = "cloud_flip+1" if flip_late else "cloud_flip"
+            return "long", stop, reason
 
-    # ---- SHORT: C2 just flipped red, C3 is red ----
+    # ---- SHORT: C2 just flipped red (or within grace window), C3 is red ----
     if c2_flip_short and c3_red:
         stop = cur.ema50
         # Rip's resistance level: if it's lower than ema50, use it — tighter
@@ -300,7 +336,11 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if resistance is not None and resistance < stop and resistance > entry_price:
             stop = resistance
         if _stop_ok(entry_price, stop, "short"):
-            return "short", stop, "cloud_flip"
+            if scalp_mode:
+                reason = "c3_scalp+1" if flip_late else "c3_scalp"
+            else:
+                reason = "cloud_flip+1" if flip_late else "cloud_flip"
+            return "short", stop, reason
 
     # ---- PMH breakout: first bar to close above pre-market high, C3 green ----
     if pmh is not None and c3_green and cur.close > pmh and prev.close <= pmh:
