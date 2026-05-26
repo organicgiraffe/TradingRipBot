@@ -44,8 +44,10 @@ FIXED_SHARES_HIGH    = 50     # 50 shares for expensive stocks ($500+)
 HIGH_PRICE_THRESHOLD = 500.0  # entry price at or above this → use FIXED_SHARES_HIGH
                                # catches META ~$610, CRWD ~$565, MU ~$800, SNDK ~$1000+
 PROFIT_TARGET_SHARE  = 5.00   # exit at +$5/share = $500 profit on 100 shares
-MIN_DAILY_RANGE      = 7.00   # skip stock if 5-day avg daily range < $7
-                               # TSLA/AMD/META/CRWD pass; AAPL/AMZN/NFLX typically fail
+MIN_DAILY_RANGE      = 10.00  # skip stock if 5-day avg daily range < $10
+                               # $10 ATR minimum: at $5/share target you need room to breathe
+                               # MU $54, ARM $27, AMD $24 pass; NVDA $6, OKLO $4 fail
+                               # TSLA ~$11 borderline — keep it, strong brand + Rip coverage
 MIN_STOP_DIST        = 0.40   # absolute floor (legacy) — superseded by MIN_STOP_PCT_LOWER below
 MIN_STOP_PCT_LOWER   = 0.0025 # 0.25% of price — stops tighter than this are noise, not signal
                               # META $605 + $0.68 stop = 0.11% → blocked
@@ -62,6 +64,9 @@ FRIDAY_OPEN_MINUTE   = 45     # Lotto Friday: hold extra 5 min — first entry 0
 MAX_RISK_DOLLARS     = 700    # skip any trade where stop_dist × shares > $700
                                # TSLA normal risk ~$550 → allowed
                                # MU Mar-31 open trade $716 → blocked (plus time filter)
+MAX_RISK_DOLLARS_HIGH = 900   # separate cap for stocks >= HIGH_PRICE_THRESHOLD ($500+)
+                               # MU $886 entry, stop $872 → $14.65 × 50sh = $732 → allowed
+                               # prevents blocking big movers just because their $ stop is wide
 MAX_SIMULTANEOUS_POSITIONS = 1   # one quality trade at a time — two positions cancel each other out
 
 # Level proximity — entry must be NEAR Rip's level, not chasing mid-range
@@ -75,6 +80,10 @@ LEVEL_PROX_SHORT = 0.020   # 2.0% below support    = max allowed for a short ent
 # Example: if ATR = $7.59 and DTR so far = $6.21, ratio = 82% — skip the trade.
 ATR_PERIODS  = 14     # trading days for ATR lookback
 DTR_MAX_PCT  = 0.75   # skip entry when DTR >= 75% of ATR (move is largely done)
+DTR_EXEMPT_ATR = 30.0 # stocks with 5-day ATR above this skip the DTR filter entirely
+                       # high-ATR momentum stocks (MU $54, AMD $25+ on catalyst days)
+                       # run beyond their average on breakout days — DTR blocks the best trades
+                       # ARM $27 stays under the threshold → DTR still applies → correctly blocked
 
 # ── Debug output ──────────────────────────────────────────────────────────────
 DEBUG_SIGNALS = True   # print a status line every 3m bar + BLOCKED reasons

@@ -26,8 +26,9 @@ from config import (TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
                     BAR_SIZE_10M, BAR_SIZE_3M,
                     MAX_SIMULTANEOUS_POSITIONS,
                     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
-                    MAX_RISK_DOLLARS, LEVEL_PROX_LONG, LEVEL_PROX_SHORT,
-                    DTR_MAX_PCT, FIRST_ENTRY_MINUTE, MARKET_OPEN_HOUR,
+                    MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH, MIN_DAILY_RANGE,
+                    LEVEL_PROX_LONG, LEVEL_PROX_SHORT,
+                    DTR_MAX_PCT, DTR_EXEMPT_ATR, FIRST_ENTRY_MINUTE, MARKET_OPEN_HOUR,
                     MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
                     VOLUME_CONFIRM_MULT, DEBUG_SIGNALS,
                     PROFIT_TARGET_SHARE)
@@ -94,6 +95,7 @@ class TradingBot:
         self.ib        = IB()
         self.bars_10m: dict = {}     # symbol -> BarDataList  (trend direction)
         self.bars_3m:  dict = {}     # symbol -> BarDataList  (entry + management)
+        self._sym_atr: dict = {}     # symbol -> 5-day avg daily range (for DTR exemption)
         self.trend:    dict = {}     # symbol -> 'bullish' | 'bearish' | 'none'
 
         self.positions: dict[str, Position] = {}
@@ -143,6 +145,29 @@ class TradingBot:
                 barSizeSetting=BAR_SIZE_10M, whatToShow="TRADES",
                 useRTH=True, keepUpToDate=False,
             )
+
+            # ATR check: compute 5-day avg daily range from 10m bars
+            # Each 10m bar has date; group by day, sum (max-min), average last 5 days
+            if b10:
+                import collections, datetime as _dt
+                day_hi: dict = collections.defaultdict(float)
+                day_lo: dict = collections.defaultdict(lambda: float("inf"))
+                for bar in b10:
+                    d = bar.date.date() if hasattr(bar.date, "date") else bar.date
+                    day_hi[d] = max(day_hi[d], bar.high)
+                    day_lo[d] = min(day_lo[d], bar.low)
+                recent_days = sorted(day_hi)[-5:]
+                avg_range = sum(day_hi[d] - day_lo[d] for d in recent_days) / len(recent_days)
+                if avg_range < MIN_DAILY_RANGE:
+                    log.info(
+                        f"  {symbol}: SKIPPED — 5-day ATR ${avg_range:.2f} < min ${MIN_DAILY_RANGE:.0f}"
+                    )
+                    self.symbols.remove(symbol)
+                    continue
+                self._sym_atr[symbol] = avg_range
+                dtr_tag = " (DTR exempt — momentum stock)" if avg_range >= DTR_EXEMPT_ATR else ""
+                log.info(f"  {symbol}: 5-day ATR ${avg_range:.2f}  (min=${MIN_DAILY_RANGE:.0f}) OK{dtr_tag}")
+
             self.bars_10m[symbol] = b10
             self._on_new_bar_10m(symbol, b10)   # set initial trend
 
@@ -323,10 +348,18 @@ class TradingBot:
                         and cur.low <= pos.level_sup):
                     half_px = pos.level_sup
 
-                # Priority 2: Flat profit target — only when no level configured
-                has_level = (pos.level_res is not None if pos.direction == "long"
-                             else pos.level_sup is not None)
-                if half_px is None and not has_level and unrealised >= PROFIT_TARGET_SHARE:
+                # Priority 2: Flat profit target — when no usable level exists.
+                # "No usable level" means either:
+                #   a) No level configured (rules-only), OR
+                #   b) Level is already behind us at entry (e.g. entry above resistance
+                #      on a gap-up — the half-exit at that level would be at a loss).
+                if pos.direction == "long":
+                    level_still_ahead = (pos.level_res is not None
+                                         and pos.level_res > pos.entry_price)
+                else:
+                    level_still_ahead = (pos.level_sup is not None
+                                         and pos.level_sup < pos.entry_price)
+                if half_px is None and not level_still_ahead and unrealised >= PROFIT_TARGET_SHARE:
                     half_px  = cur.close
                     half_rsn = "half@target"
 
@@ -381,10 +414,14 @@ class TradingBot:
             return
 
         # DTR/ATR exhaustion gate — skip when daily range is >= 75% of ATR
-        dtr_ratio = compute_dtr_atr_ratio(df_10m, today, bar_time=now)
-        if dtr_ratio > DTR_MAX_PCT:
+        # Exempt high-ATR momentum stocks (≥ DTR_EXEMPT_ATR): they regularly exceed
+        # their average on breakout days — blocking them misses the best trades.
+        sym_atr_5d = getattr(self, "_sym_atr", {}).get(symbol, 0.0)
+        dtr_ratio  = compute_dtr_atr_ratio(df_10m, today, bar_time=now)
+        dtr_exempt = sym_atr_5d >= DTR_EXEMPT_ATR
+        if not dtr_exempt and dtr_ratio > DTR_MAX_PCT:
             if DEBUG_SIGNALS:
-                print(f"  {now.strftime('%H:%M')}  {symbol:6s}  SKIP: DTR {dtr_ratio:.0%} of ATR")
+                print(f"  {now.strftime('%H:%M')}  {symbol:6s}  SKIP: DTR {dtr_ratio:.0%} of ATR  (ATR=${sym_atr_5d:.0f})")
             return
 
         # Rip's levels for this symbol (None = rules-only, no filter applied)
@@ -463,11 +500,12 @@ class TradingBot:
         n    = FIXED_SHARES_HIGH if entry_price >= HIGH_PRICE_THRESHOLD else FIXED_SHARES
         risk = stop_dist * n
 
-        # Hard dollar risk cap — skip if stop is too wide
-        if risk > MAX_RISK_DOLLARS:
+        # Hard dollar risk cap — use higher cap for expensive stocks ($500+)
+        risk_cap = MAX_RISK_DOLLARS_HIGH if entry_price >= HIGH_PRICE_THRESHOLD else MAX_RISK_DOLLARS
+        if risk > risk_cap:
             tlog.info(
                 f"SKIP  {symbol}  {signal.upper():<5}  ${entry_price:.2f}  "
-                f"stop=${stop_price:.2f}  risk=${risk:.0f} > cap ${MAX_RISK_DOLLARS}  "
+                f"stop=${stop_price:.2f}  risk=${risk:.0f} > cap ${risk_cap}  "
                 f"[{entry_reason}]"
             )
             return
@@ -681,7 +719,8 @@ class TradingBot:
         tlog.info("BOT LIVE  symbols=" + ", ".join(self.symbols))
         tlog.info(f"  entry gate: 09:{FIRST_ENTRY_MINUTE:02d} ET | "
                   f"max_pos={MAX_SIMULTANEOUS_POSITIONS} | "
-                  f"risk_cap=${MAX_RISK_DOLLARS} | "
+                  f"risk_cap=${MAX_RISK_DOLLARS} (<${HIGH_PRICE_THRESHOLD:.0f}) "
+                  f"/ ${MAX_RISK_DOLLARS_HIGH} (>=${HIGH_PRICE_THRESHOLD:.0f}) | "
                   f"DTR_max={DTR_MAX_PCT:.0%} | "
                   f"debug={'ON' if DEBUG_SIGNALS else 'OFF'}")
         for sym in self.symbols:
