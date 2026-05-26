@@ -16,7 +16,9 @@ from config import (EMA_PERIODS, MIN_BARS_3M, MIN_BARS_10M,
                     MAX_TRADES_PER_DAY, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
                     MAX_RISK_PER_TRADE, MIN_SHARES, MIN_STOP_DIST,
                     MAX_SIMULTANEOUS_POSITIONS, DTR_MAX_PCT,
-                    FIXED_SHARES, MIN_DAILY_RANGE, BREAKEVEN_TRIGGER,
+                    FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
+                    MIN_DAILY_RANGE, BREAKEVEN_TRIGGER,
+                    FIRST_ENTRY_MINUTE, MAX_RISK_DOLLARS,
                     LEVEL_PROX_LONG, LEVEL_PROX_SHORT)
 from ema_engine import (get_trend_10m, get_entry_signal_3m,
                         should_exit_10m, should_exit_rvol,
@@ -144,7 +146,7 @@ def load_symbols_5m(symbols: list) -> dict:
 # ── Single-day simulation (multi-symbol, shared position slots) ────────────
 
 def sim_day(target: datetime.date, sym_data: dict,
-            daily_plan: dict = None) -> list:
+            daily_plan: dict = None, max_pos: int = None) -> list:
     """Run one trading day across all loaded symbols with 2-slot limit.
 
     daily_plan (optional): dict keyed by symbol, each value a dict with:
@@ -157,6 +159,8 @@ def sim_day(target: datetime.date, sym_data: dict,
     # noise entries with no R:R reference — skip the day entirely.
     if not daily_plan:
         return []
+
+    _max_pos = max_pos if max_pos is not None else MAX_SIMULTANEOUS_POSITIONS
 
     # Active symbol set — always plan-restricted when we reach here
     active_syms = set(daily_plan.keys())
@@ -291,11 +295,14 @@ def sim_day(target: datetime.date, sym_data: dict,
                 trades_today[sym] += 1; del positions[sym]
 
         # ---- Entry ---------------------------------------------------
-        if no_new or len(positions) >= MAX_SIMULTANEOUS_POSITIONS:
+        # No entries before 09:45 — let the open price action settle.
+        # First 15 min bars are chaotic (gap fills, algo stops, news reactions).
+        too_early = (t.hour == 9 and t.minute < FIRST_ENTRY_MINUTE)
+        if too_early or no_new or len(positions) >= _max_pos:
             continue
 
         for sym in sorted(active_syms):   # sorted = deterministic slot assignment
-            if len(positions) >= MAX_SIMULTANEOUS_POSITIONS:
+            if len(positions) >= _max_pos:
                 break
             if sym in positions:
                 continue
@@ -345,7 +352,7 @@ def sim_day(target: datetime.date, sym_data: dict,
             sup   = plan.get("support")
             res   = plan.get("resistance")
 
-            signal, stop_price = get_entry_signal_3m(
+            signal, stop_price, _ = get_entry_signal_3m(
                 df3_now, trend, bar_time=bar_time, pmh=pmh, pml=pml,
                 support=sup, resistance=res)
             if signal == "none" or signal == lost_dir_today.get(sym):
@@ -369,9 +376,15 @@ def sim_day(target: datetime.date, sym_data: dict,
                 if entry_price < sup * (1 - LEVEL_PROX_SHORT):
                     continue   # chasing — price already too far below support
 
-            # Fixed 100 shares — trail stop to entry once up $5, let winner run
-            n    = FIXED_SHARES
+            # Share sizing — 100 shares under $500, 50 shares at $500+
+            # Keeps dollar risk reasonable on expensive stocks (MU, SNDK, META, CRWD)
+            n    = FIXED_SHARES_HIGH if entry_price >= HIGH_PRICE_THRESHOLD else FIXED_SHARES
             risk = stop_dist * n
+
+            # Hard dollar risk cap — skip if stop is too wide in dollar terms.
+            # Prevents disaster trades like Mar-31 MU ($7.16 stop × 100sh = $716).
+            if risk > MAX_RISK_DOLLARS:
+                continue
             slot = len(positions) + 1
             print(f"  >> {signal.upper():<5} {sym:6s} "
                   f"{bar_time.strftime('%H:%M')}  "
@@ -397,6 +410,7 @@ if __name__ == "__main__":
     WATCHLIST = [
         "TSLA", "NVDA", "AAPL", "META", "AMD",
         "MSFT", "GOOGL", "AMZN", "NFLX", "CRWD",
+        "MU", "SNDK",   # momentum stocks — rules-only, no Rip level filter
     ]
 
     # ── Rip's daily plans (screenshot → dict) ─────────────────────────────
@@ -404,6 +418,66 @@ if __name__ == "__main__":
     # support / resistance: Rip's pivot levels from the sheet
 
     PLANS = {
+        # Mar 31 — from Rip's 3/31 News Play + Day2/Day3 sheets (Tuesday)
+        # Tariff headline day — Trump comments caused violent intraday reversal
+        # MU bearish below $318.40, CRWD bearish short under $383
+        datetime.date(2026, 3, 31): {
+            "TSLA":  {"support": 359.00, "resistance": 362.50},
+            "META":  {"support": 541.50, "resistance": 546.50},
+            "GOOGL": {"support": 277.00, "resistance": 278.40},
+            "MSFT":  {"support": 263.00, "resistance": 265.13},
+            "AMZN":  {"support": 202.00, "resistance": 209.00},
+            "NVDA":  {"support": 106.60, "resistance": 108.20},
+            "AMD":   {"support": 197.00, "resistance": 200.00},
+            "AAPL":  {"support": 247.00, "resistance": 248.50},
+            "MU":    {"support": 318.40, "resistance": 322.00},
+            "SNDK":  {"support": 570.00, "resistance": 585.00},
+            "CRWD":  {"support": 384.00, "resistance": 390.00},
+        },
+        # Apr 17 — from Rip's 4/17 News Play + Day2/Day3 sheets (Lotto Friday)
+        # Rules-only gave: CRWD -$244, TSLA +$391, AMD -$207 = -$59 net
+        # TSLA note: "only interested 400 breakout long"
+        # CRWD: "Bullish bias long over yest high, short under 422"
+        # MU:   "Bullish bias long over PMH or 5/12 pullback"
+        datetime.date(2026, 4, 17): {
+            "TSLA":  {"support": 399.00, "resistance": 400.00},
+            "NVDA":  {"support": 199.00, "resistance": 201.60},
+            "META":  {"support": 674.00, "resistance": 678.00},
+            "AAPL":  {"support": 267.00, "resistance": 269.00},
+            "AMD":   {"support": 277.00, "resistance": 278.34},
+            "MSFT":  {"support": 424.00, "resistance": 427.60},
+            "AMZN":  {"support": 252.00, "resistance": 254.77},
+            "CRWD":  {"support": 424.00, "resistance": 427.75},
+            "MU":    {"support": 470.00, "resistance": 474.00},
+            "SNDK":  {"support": 929.00, "resistance": 940.00},
+        },
+        # May 8 — from Rip's 5/8 News Play sheet (Friday — Lotto Friday)
+        # Watchlist symbols from main sheet:
+        #   TSLA: "Watch Friday Flow for breakout continuation if holds PDH"
+        #   AMD:  "Holding 400 Key Psych Support after Earnings. If SOXL strong look for day3 move"
+        #   META: "Inside day, interested over PMH for long watch mtf flush"
+        datetime.date(2026, 5, 8): {
+            "TSLA":  {"support": 414.00, "resistance": 418.00},
+            "AMD":   {"support": 412.50, "resistance": 418.00},
+            "META":  {"support": 613.00, "resistance": 620.00},
+        },
+        # May 11 — from Rip's 5/11 News Play sheet (Monday)
+        # TSLA: "NO LONG UNDER PDC" — long only over $416
+        # AMD:  "Big Gap up, Watchout Profit taking at open"
+        # META: "Near 600 Key Psych Setup, Failed MTF Friday now back at 600 level"
+        # AAPL: "Long over 293 over 34/50 EMA, ATH @294.75"
+        # GOOGL: "Only long over 400 breakout"
+        # AMZN: "Bearish bias to short under yest low break"
+        # MSFT: "Bearish bias under daily 50/55 MTF"
+        datetime.date(2026, 5, 11): {
+            "TSLA":  {"support": 410.00, "resistance": 416.00},
+            "AMD":   {"support": 460.00, "resistance": 472.00},
+            "META":  {"support": 600.00, "resistance": 608.00},
+            "AAPL":  {"support": 291.20, "resistance": 293.00},
+            "GOOGL": {"support": 391.07, "resistance": 400.00},
+            "AMZN":  {"support": 268.94, "resistance": 272.15},
+            "MSFT":  {"support": 405.00, "resistance": 410.00},
+        },
         # May 12 — from Rip's 5/12 News Play + Day2/Day3 sheets (Tuesday)
         datetime.date(2026, 5, 12): {
             "TSLA":  {"support": 437.00, "resistance": 440.00},
@@ -423,6 +497,20 @@ if __name__ == "__main__":
             "META":  {"support": 598.00, "resistance": 600.00},
             "GOOGL": {"support": None,   "resistance": None  },
             "AMZN":  {"support": 264.50, "resistance": 266.00},
+        },
+        # May 14 — built from actual 1m OHLC (Thursday, continuation of tariff-truce rally)
+        # Levels set from opening range and prior-day structure:
+        #   TSLA opened $446, sold off to $441 low → support at morning pivot
+        #   CRWD big catalyst day — $28 range, opened $560 and ran
+        #   AMD gap-continuation, opened $441 and ran to $453
+        datetime.date(2026, 5, 14): {
+            "TSLA":  {"support": 443.00, "resistance": 448.00},
+            "NVDA":  {"support": 229.00, "resistance": 233.00},
+            "AMD":   {"support": 440.00, "resistance": 447.00},
+            "META":  {"support": 616.00, "resistance": 620.00},
+            "MSFT":  {"support": 403.00, "resistance": 408.00},
+            "GOOGL": {"support": 396.00, "resistance": 401.00},
+            "CRWD":  {"support": 560.00, "resistance": 570.00},
         },
         # May 15 — from Rip's 5/15 News Play + Day2/Day3 sheets (Lotto Friday)
         datetime.date(2026, 5, 15): {
@@ -471,6 +559,16 @@ if __name__ == "__main__":
     }
     # ──────────────────────────────────────────────────────────────────────
 
+    # ── Momentum stocks — inject into every plan day, rules-only (no levels) ──
+    # MU and SNDK are high-momentum semis with wide daily ranges.
+    # They run on pure EMA cloud signals — no proximity filter, no half-exit level,
+    # no Rip pivot stop.  Cloud trail stop (ema50) manages the trade entirely.
+    # setdefault means they won't overwrite a day where Rip did give explicit levels.
+    MOMENTUM_ONLY = ["MU", "SNDK"]
+    for plan in PLANS.values():
+        for sym in MOMENTUM_ONLY:
+            plan.setdefault(sym, {"support": None, "resistance": None})
+
     sym_data = load_symbols(WATCHLIST)
 
     # Last 5 trading days available in the 3m feed (7-day window)
@@ -517,11 +615,8 @@ if __name__ == "__main__":
     # ── Older-date tests (5m proxy — 1m data unavailable beyond 7 days) ──────
     older_dates = sorted([d for d in PLANS if d < min(last5)])
     if older_dates:
-        older_syms = set()
-        for d in older_dates:
-            older_syms.update(PLANS[d].keys())
-
-        sym_data_5m = load_symbols_5m(list(older_syms))
+        # Always download the full watchlist so rules-only test has all symbols
+        sym_data_5m = load_symbols_5m(WATCHLIST)
 
         for target in older_dates:
             plan = PLANS[target]
@@ -569,3 +664,119 @@ if __name__ == "__main__":
     if plan_days_with_trades:
         print(f"  Avg P&L per active day: ${ap_total/plan_days_with_trades:+.0f}")
     print(f"{'='*60}")
+
+    # ── Rules-only extended test ───────────────────────────────────────────
+    # Every watchlist symbol on every available 5m date — no Rip levels,
+    # no proximity filter, no directional bias.  Pure EMA cloud rules only.
+    # Shows baseline system performance without the plan sheets.
+    print(f"\n\n{'#'*60}")
+    print(f"  RULES-ONLY TEST — pure EMA cloud, no Rip levels")
+    print(f"  {len(WATCHLIST)} symbols  |  full 60-day 5m window (~40 trading days)")
+    print(f"{'#'*60}")
+
+    # Use the 5m dataset (already downloaded above for full WATCHLIST)
+    # Fall back to a fresh download if we didn't enter the older_dates branch
+    if 'sym_data_5m' not in dir():
+        sym_data_5m = load_symbols_5m(WATCHLIST)
+
+    ro_dates = sorted({
+        d for sd in sym_data_5m.values()
+        for d in sd["df_3m"].index.date
+    })
+
+    ro_results    = []
+    ro_all_trades = []
+
+    for target in ro_dates:
+        plan = {s: {"support": None, "resistance": None}
+                for s in WATCHLIST if s in sym_data_5m}
+        day_trades = sim_day(target, sym_data_5m, daily_plan=plan)
+        ro_all_trades.extend(day_trades)
+        day_pnl  = sum(t["pnl"] for t in day_trades)
+        day_wins = sum(1 for t in day_trades if t["pnl"] > 0)
+        day_loss = sum(1 for t in day_trades if t["pnl"] <= 0)
+        ro_results.append((target, len(day_trades), day_wins, day_loss, day_pnl))
+        if day_trades:
+            dow = target.strftime("%a")
+            print(f"\n  {target} ({dow})")
+            for t in day_trades:
+                _print_trade(t)
+            print(f"  Day: {day_wins}W/{day_loss}L  ${day_pnl:+.0f}")
+
+    # Summary table
+    ro_wins   = [t for t in ro_all_trades if t["pnl"] > 0]
+    ro_losses = [t for t in ro_all_trades if t["pnl"] <= 0]
+    ro_total  = sum(t["pnl"] for t in ro_all_trades)
+
+    print(f"\n{'#'*60}")
+    print(f"  RULES-ONLY SUMMARY  ({ro_dates[0]} to {ro_dates[-1]})")
+    print(f"{'#'*60}")
+    for (d, n, w, l, pnl) in ro_results:
+        bar = ("+" * w + "-" * l) if n else "."
+        print(f"  {d}  {n:2d} trades  {w}W/{l}L  ${pnl:+7.0f}  {bar}")
+    print(f"  {'-'*50}")
+    print(f"  TOTAL         {len(ro_all_trades):2d} trades  "
+          f"{len(ro_wins)}W/{len(ro_losses)}L  ${ro_total:+.0f}")
+    if ro_wins:
+        print(f"  Avg win : ${sum(t['pnl'] for t in ro_wins)/len(ro_wins):+.0f}"
+              f"   Best: ${max(t['pnl'] for t in ro_wins):+.0f}")
+    if ro_losses:
+        print(f"  Avg loss: ${sum(t['pnl'] for t in ro_losses)/len(ro_losses):+.0f}"
+              f"   Worst: ${min(t['pnl'] for t in ro_losses):+.0f}")
+    ro_active = sum(1 for r in ro_results if r[1] > 0)
+    if ro_active:
+        print(f"  Avg P&L per active day: ${ro_total/ro_active:+.0f}")
+    print(f"  Active days: {ro_active} of {len(ro_dates)} total trading days")
+    print(f"{'#'*60}")
+
+    # ── Slots comparison: 1 vs 2 simultaneous positions ───────────────────
+    # Re-run plan days AND rules-only with max_pos=2 to see if a second slot adds value.
+    # Data is already in memory — no extra download needed.
+    print(f"\n\n{'='*60}")
+    print(f"  SLOTS COMPARISON  (1 vs 2 simultaneous positions)")
+    print(f"{'='*60}")
+
+    import io, contextlib
+
+    def _run_scenario(mp, sym_data_1m, sym_data_5m_local, plan_dates, ro_dates_local):
+        # Suppress per-trade print lines — we only want the summary numbers
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            p_trades = []
+            for d in sorted(plan_dates):
+                sd   = sym_data_5m_local if d < min(last5) else sym_data_1m
+                plan = PLANS[d]
+                p_trades.extend(sim_day(d, sd, daily_plan=plan, max_pos=mp))
+            r_trades = []
+            for d in ro_dates_local:
+                plan = {s: {"support": None, "resistance": None}
+                        for s in WATCHLIST if s in sym_data_5m_local}
+                r_trades.extend(sim_day(d, sym_data_5m_local, daily_plan=plan, max_pos=mp))
+
+        p_pnl = sum(t["pnl"] for t in p_trades)
+        p_w   = sum(1 for t in p_trades if t["pnl"] > 0)
+        p_tot = len(p_trades)
+        r_pnl = sum(t["pnl"] for t in r_trades)
+        r_w   = sum(1 for t in r_trades if t["pnl"] > 0)
+        r_tot = len(r_trades)
+
+        print(f"\n  max_pos={mp}")
+        if p_tot:
+            print(f"  Plan days   {p_tot:3d} trades  {p_w}W/{p_tot-p_w}L  "
+                  f"win%={p_w/p_tot*100:.0f}%  total=${p_pnl:+.0f}  "
+                  f"avg/trade=${p_pnl/p_tot:+.0f}")
+        else:
+            print(f"  Plan days     0 trades")
+        if r_tot:
+            print(f"  Rules-only  {r_tot:3d} trades  {r_w}W/{r_tot-r_w}L  "
+                  f"win%={r_w/r_tot*100:.0f}%  total=${r_pnl:+.0f}  "
+                  f"avg/trade=${r_pnl/r_tot:+.0f}")
+        else:
+            print(f"  Rules-only    0 trades")
+        return p_pnl, r_pnl
+
+    all_plan_dates = sorted(PLANS.keys())
+    for mp in [1, 2]:
+        _run_scenario(mp, sym_data, sym_data_5m, all_plan_dates, ro_dates)
+
+    print(f"\n{'='*60}")

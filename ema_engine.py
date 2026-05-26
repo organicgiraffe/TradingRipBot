@@ -208,7 +208,7 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
                         bar_time=None,
                         pmh: float = None, pml: float = None,
                         support: float = None,
-                        resistance: float = None) -> tuple[str, float]:
+                        resistance: float = None) -> tuple[str, float, str]:
     """
     Ripster cloud flip — simple as it gets.
 
@@ -221,6 +221,11 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
 
     Volume must be above average.  No entries before 09:40 ET.
 
+    Returns: (signal, stop_price, entry_reason)
+      signal       - 'long' | 'short' | 'none'
+      stop_price   - initial stop level (0.0 when signal is 'none')
+      entry_reason - 'cloud_flip' | 'pmh_breakout' | 'pml_breakdown' | ''
+
     Live-trading note — early entry on volume:
       Don't wait for the bar to close.  As soon as ema5 crosses ema12 on the
       live 3-min bar AND volume is already tracking above average mid-candle,
@@ -228,7 +233,7 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
       on a momentum move.
     """
     if len(df_3m) < MIN_BARS_3M:
-        return "none", 0.0
+        return "none", 0.0, ""
 
     cur  = df_3m.iloc[-1]
     prev = df_3m.iloc[-2]
@@ -238,30 +243,29 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
     # On Fridays (options expiry / Lotto Friday) push to 09:45 — the open
     # bar is hit by violent expiry-driven moves that stop out clean setups.
     if bar_time is not None:
-        is_friday  = (bar_time.weekday() == 4)
+        is_friday   = (bar_time.weekday() == 4)
         open_minute = FRIDAY_OPEN_MINUTE if is_friday else MARKET_OPEN_MINUTE
         if (bar_time.hour < MARKET_OPEN_HOUR or
                 (bar_time.hour == MARKET_OPEN_HOUR
                  and bar_time.minute < open_minute)):
-            return "none", 0.0
+            return "none", 0.0, ""
 
     # No new entries after 15:00 — not enough time for trade to develop before close
     if bar_time is not None:
         if (bar_time.hour > LAST_ENTRY_HOUR or
                 (bar_time.hour == LAST_ENTRY_HOUR
                  and bar_time.minute >= LAST_ENTRY_MINUTE)):
-            return "none", 0.0
+            return "none", 0.0, ""
 
     # Volume gate — above-average participation confirms the move is real
     if cur.vol_ma20 > 0 and cur.volume < VOLUME_CONFIRM_MULT * cur.vol_ma20:
-        return "none", 0.0
+        return "none", 0.0, ""
 
     # Trend gate — 10m must show a clear direction.
     # When trend is 'none', both clouds are mixed or price is straddling ema200.
     # C2 flips in that environment are noise — skip everything.
-    # The plan keeps us in strong stocks; the trend gate keeps us in strong moments.
     if trend == "none":
-        return "none", 0.0
+        return "none", 0.0, ""
 
     # Cloud 2 flip: ema5 crosses ema12
     c2_flip_long  = prev.ema5 <= prev.ema12 and cur.ema5 > cur.ema12
@@ -272,12 +276,11 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
     c3_red   = cur.ema34 < cur.ema50
 
     # 10-min trend filter — don't fight the established macro trend.
-    # 'none' means unclear → allow both directions.
     # 'bullish' → skip shorts.  'bearish' → skip longs.
     if trend == "bearish" and c2_flip_long:
-        return "none", 0.0
+        return "none", 0.0, ""
     if trend == "bullish" and c2_flip_short:
-        return "none", 0.0
+        return "none", 0.0, ""
 
     # ---- LONG: C2 just flipped green, C3 is green ----
     if c2_flip_long and c3_green:
@@ -287,7 +290,7 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if support is not None and support > stop and support < entry_price:
             stop = support
         if _stop_ok(entry_price, stop, "long"):
-            return "long", stop
+            return "long", stop, "cloud_flip"
 
     # ---- SHORT: C2 just flipped red, C3 is red ----
     if c2_flip_short and c3_red:
@@ -297,7 +300,7 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if resistance is not None and resistance < stop and resistance > entry_price:
             stop = resistance
         if _stop_ok(entry_price, stop, "short"):
-            return "short", stop
+            return "short", stop, "cloud_flip"
 
     # ---- PMH breakout: first bar to close above pre-market high, C3 green ----
     if pmh is not None and c3_green and cur.close > pmh and prev.close <= pmh:
@@ -306,7 +309,7 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if support is not None and support > stop and support < entry_price:
             stop = support
         if _stop_ok(entry_price, stop, "long"):
-            return "long", stop
+            return "long", stop, "pmh_breakout"
 
     # ---- PML breakdown: first bar to close below pre-market low, C3 red ----
     if pml is not None and c3_red and cur.close < pml and prev.close >= pml:
@@ -315,9 +318,9 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
         if resistance is not None and resistance < stop and resistance > entry_price:
             stop = resistance
         if _stop_ok(entry_price, stop, "short"):
-            return "short", stop
+            return "short", stop, "pml_breakdown"
 
-    return "none", 0.0
+    return "none", 0.0, ""
 
 
 # ------------------------------------------------------------------ #

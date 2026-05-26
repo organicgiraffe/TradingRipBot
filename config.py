@@ -39,7 +39,10 @@ MAX_RISK_PER_TRADE   = 200.0  # max $ at risk per trade — shares are sized dyn
 MIN_SHARES           = 1      # never go below 1 share
 
 # ── $500/day target parameters ────────────────────────────────────────────────
-FIXED_SHARES         = 100    # flat 100 shares per position
+FIXED_SHARES         = 100    # flat 100 shares per position (stocks under HIGH_PRICE_THRESHOLD)
+FIXED_SHARES_HIGH    = 50     # 50 shares for expensive stocks ($500+)
+HIGH_PRICE_THRESHOLD = 500.0  # entry price at or above this → use FIXED_SHARES_HIGH
+                               # catches META ~$610, CRWD ~$565, MU ~$800, SNDK ~$1000+
 PROFIT_TARGET_SHARE  = 5.00   # exit at +$5/share = $500 profit on 100 shares
 MIN_DAILY_RANGE      = 7.00   # skip stock if 5-day avg daily range < $7
                                # TSLA/AMD/META/CRWD pass; AAPL/AMZN/NFLX typically fail
@@ -51,9 +54,14 @@ CLOUD_EXIT_BUFFER    = 0.10   # price must close at least $0.10 PAST ema34 to ex
                               # prevents false exits when price just grazes the cloud edge
 GAP_THRESHOLD        = 0.020  # ema50 > 2.0% from price = Day1 gap-up/down catalyst play
                               # above this: use ema12 as tighter stop, allow TYPE 1b entry
+FIRST_ENTRY_MINUTE   = 40     # no entries before 09:40 — skip the first 5-min chaos
+                               # 9:40-9:44 setups are valid; $700 risk cap handles disasters
 LAST_ENTRY_HOUR      = 15     # no new entries at or after this hour (ET)
 LAST_ENTRY_MINUTE    = 0      # → 15:00  gives at least 50 min for trade to develop
-FRIDAY_OPEN_MINUTE   = 45     # Lotto Friday: skip wild open, first entry at 09:45
+FRIDAY_OPEN_MINUTE   = 45     # Lotto Friday: hold extra 5 min — first entry 09:45
+MAX_RISK_DOLLARS     = 700    # skip any trade where stop_dist × shares > $700
+                               # TSLA normal risk ~$550 → allowed
+                               # MU Mar-31 open trade $716 → blocked (plus time filter)
 MAX_SIMULTANEOUS_POSITIONS = 1   # one quality trade at a time — two positions cancel each other out
 
 # Level proximity — entry must be NEAR Rip's level, not chasing mid-range
