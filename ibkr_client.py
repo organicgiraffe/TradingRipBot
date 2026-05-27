@@ -773,7 +773,7 @@ class TradingBot:
 
     def print_session_summary(self):
         exits    = [t for t in self.trade_log if t["event"] == "exit"]
-        partials = [t for t in self.trade_log if t["event"] == "half@level"]
+        partials = [t for t in self.trade_log if t["event"] in ("half@level", "half@target")]
         total    = sum(t["pnl"] for t in self.trade_log)
         wins     = sum(1 for t in exits if t["pnl"] > 0)
         losses   = sum(1 for t in exits if t["pnl"] <= 0)
@@ -785,7 +785,7 @@ class TradingBot:
             print("  No trades today.")
         for t in self.trade_log:
             sign = "+" if t["pnl"] >= 0 else ""
-            if t["event"] == "half@level":
+            if t["event"] in ("half@level", "half@target"):
                 tag = "H"
             elif t["pnl"] > 0:
                 tag = "W"
