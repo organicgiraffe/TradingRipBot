@@ -49,7 +49,7 @@ class Bar:
 def download_and_resample(sym):
     df = yf.download(sym, period="5d", interval="1m",
                      auto_adjust=True, progress=False, prepost=True)
-    if df.empty: return None, None, None, None
+    if df.empty: return None, None, None, None, None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
@@ -61,6 +61,11 @@ def download_and_resample(sym):
     pmh = float(today_pre["high"].max()) if not today_pre.empty else None
     pml = float(today_pre["low"].min()) if not today_pre.empty else None
     df = df.between_time("09:30", "15:59")
+    # 1-min bars for today — index labeled with close time (open + 1 min).
+    # Used for intrabar ratchet/stop management so we see peaks within each
+    # 3-min bar, not just at bar close.
+    df1_today = df[df.index.date == TODAY].copy()
+    df1_today.index = df1_today.index + pd.Timedelta(minutes=1)
     def rsmp(m):
         r = df.resample(f"{m}min", closed="left", label="left").agg(
             open=("open","first"), high=("high","max"),
@@ -68,7 +73,7 @@ def download_and_resample(sym):
         ).dropna(subset=["close"])
         r.index += pd.Timedelta(minutes=m)
         return r
-    return rsmp(3), rsmp(10), pmh, pml
+    return rsmp(3), rsmp(10), df1_today, pmh, pml
 
 
 def to_bars(df):
@@ -101,7 +106,7 @@ sym_atr    = {}   # sym -> 5-day avg daily range ($) — used for priority scori
 
 skipped_atr = {}
 for sym, lev in PLAN.items():
-    df3, df10, pmh, pml = download_and_resample(sym)
+    df3, df10, df1_today, pmh, pml = download_and_resample(sym)
     if df3 is None: continue
     b10 = to_bars(df10); b3 = to_bars(df3)
     t3  = [b for b in b3 if pd.Timestamp(b.date).date() == TODAY]
@@ -120,7 +125,7 @@ for sym, lev in PLAN.items():
     if atr < MIN_DAILY_RANGE:
         skipped_atr[sym] = atr
         continue   # too low ATR — not worth trading
-    sym_data[sym] = (b3, b10, t3, sh, pmh, pml)
+    sym_data[sym] = (b3, b10, t3, sh, pmh, pml, df1_today)
     lost_dir[sym] = None
     trades_today[sym] = 0
 
@@ -148,7 +153,7 @@ for bt in all_times:
         sym   = t["sym"]
         sig   = t["sig"]
         entry = t["entry"]
-        b3, b10, today3, shares, pmh, pml = sym_data[sym]
+        b3, b10, today3, shares, pmh, pml, df1_today = sym_data[sym]
 
         # Find the bar for this symbol at this time
         fb = next((b for b in today3 if pd.Timestamp(b.date) == bt), None)
@@ -160,45 +165,69 @@ for bt in all_times:
         df3f = compute_emas(b3f)
         cur  = df3f.iloc[-1]
 
-        unr = (cur.close - entry) if sig=="long" else (entry - cur.close)
-        t["stop_cur"] = trail_stop(sig, t["stop_cur"], entry, t["best_unr"], cur.ema50)
-
         exit_px  = None
         exit_why = None
 
-        # EOD close
+        # EOD close — check before 1-min loop
         if (fbt.hour > MARKET_CLOSE_HOUR or
                 (fbt.hour == MARKET_CLOSE_HOUR and fbt.minute >= MARKET_CLOSE_MINUTE)):
             exit_px = fb.close; exit_why = "eod_close"
 
-        # Half-exit check (every bar)
-        if not t["half_done"] and exit_px is None:
-            sup = PLAN[sym]["support"]; res = PLAN[sym]["resistance"]
-            hpx = None; hrsn = "half@level"
-            if sig=="long"  and res and fb.high >= res: hpx = res
-            elif sig=="short" and sup and fb.low  <= sup: hpx = sup
-            if sig=="long":   level_ahead = res is not None and res > entry
-            else:              level_ahead = sup is not None and sup < entry
-            if hpx is None and not level_ahead and unr >= PROFIT_TARGET_SHARE:
-                hpx = cur.close; hrsn = "half@target"
-            if hpx is not None:
-                hp = ((hpx-entry) if sig=="long" else (entry-hpx)) * (shares//2)
-                if hp > 0:
-                    t["half_pnl"]  = hp
-                    t["remaining"] = shares - shares//2
-                t["half_done"] = True
-
-        t["best_unr"] = max(t["best_unr"], unr)
-        t["peak_unr"] = max(t["peak_unr"], unr)
-
-        # Hard stop
+        # ── 1-min bar management: ratchet + half-exit + stop ─────────────
+        # Walk the three 1-min bars that make up this 3-min period.
+        # Using 1-min highs/lows means the ratchet activates when price peaks
+        # (not just at bar close) — prevents giving back intrabar gains.
+        # Ordering: update stop → check half-exit → check stop → update HWM.
+        # "Update HWM last" is the anti-phantom rule: the same bar that raises
+        # the ratchet floor cannot immediately hit it.
         if exit_px is None:
-            if sig=="long"  and fb.low  <= t["stop_cur"]:
-                exit_px = t["stop_cur"]; exit_why = "stop"
-            elif sig=="short" and fb.high >= t["stop_cur"]:
-                exit_px = t["stop_cur"]; exit_why = "stop"
+            sup = PLAN[sym]["support"]; res = PLAN[sym]["resistance"]
+            if sig=="long": level_ahead = res is not None and res > entry
+            else:           level_ahead = sup is not None and sup < entry
+            m1_window = df1_today[
+                (df1_today.index > fbt - pd.Timedelta(minutes=3)) &
+                (df1_today.index <= fbt)
+            ]
+            for _, m1 in m1_window.iterrows():
+                if exit_px is not None:
+                    break
 
-        # RVOL + C2 gate
+                # Step 1 — Update trailing stop using PREVIOUS best_unr
+                t["stop_cur"] = trail_stop(sig, t["stop_cur"], entry,
+                                           t["best_unr"], cur.ema50)
+
+                # Step 2 — Half-exit at Rip's level (1-min resolution)
+                if not t["half_done"]:
+                    hpx = None; hrsn = "half@level"
+                    if sig=="long"  and res and m1["high"] >= res: hpx = res
+                    elif sig=="short" and sup and m1["low"]  <= sup: hpx = sup
+                    m1_unr = ((m1["close"] - entry) if sig=="long"
+                              else (entry - m1["close"]))
+                    if hpx is None and not level_ahead and m1_unr >= PROFIT_TARGET_SHARE:
+                        hpx = m1["close"]; hrsn = "half@target"
+                    if hpx is not None:
+                        hp = ((hpx-entry) if sig=="long" else (entry-hpx)) * (shares//2)
+                        if hp > 0:
+                            t["half_pnl"]  = hp
+                            t["remaining"] = shares - shares//2
+                        t["half_done"] = True
+
+                # Step 3 — Hard stop using 1-min low/high
+                if sig=="long"  and m1["low"]  <= t["stop_cur"]:
+                    exit_px = t["stop_cur"]; exit_why = "stop"; break
+                elif sig=="short" and m1["high"] >= t["stop_cur"]:
+                    exit_px = t["stop_cur"]; exit_why = "stop"; break
+
+                # Step 4 — Update HWM AFTER stop check (anti-phantom guarantee)
+                if sig=="long":
+                    t["best_unr"] = max(t["best_unr"], m1["high"] - entry)
+                    t["peak_unr"] = max(t["peak_unr"], m1["high"] - entry)
+                else:
+                    t["best_unr"] = max(t["best_unr"], entry - m1["low"])
+                    t["peak_unr"] = max(t["peak_unr"], entry - m1["low"])
+
+        # ── 3-min checks: RVOL + C2 (only if still in trade) ────────────
+        # Volume/momentum exits only make sense at bar closes — don't move to 1m.
         if exit_px is None:
             locked     = (t["stop_cur"] > entry) if sig=="long" else (t["stop_cur"] < entry)
             c2_against = (cur.ema5 < cur.ema12) if sig=="long" else (cur.ema5 > cur.ema12)
@@ -234,7 +263,7 @@ for bt in all_times:
     # Collect ALL valid signals this bar, then pick highest ATR
     candidates = []
     for sym in sym_data:
-        b3, b10, today3, shares, pmh, pml = sym_data[sym]
+        b3, b10, today3, shares, pmh, pml, df1_today = sym_data[sym]
         sup = PLAN[sym]["support"]; res = PLAN[sym]["resistance"]
         if trades_today.get(sym, 0) >= MAX_TRADES_PER_DAY:
             continue
@@ -293,7 +322,7 @@ for bt in all_times:
 if in_trade and open_trade:
     t    = open_trade
     sym  = t["sym"]
-    b3, b10, today3, shares, pmh, pml = sym_data[sym]
+    b3, b10, today3, shares, pmh, pml, df1_today = sym_data[sym]
     last = today3[-1]
     exit_px = last.close; fbt = pd.Timestamp(last.date)
     runner  = ((exit_px-t["entry"])*t["remaining"]) if t["sig"]=="long" else ((t["entry"]-exit_px)*t["remaining"])

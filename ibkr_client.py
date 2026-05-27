@@ -183,6 +183,136 @@ class TradingBot:
             log.info(f"  {symbol}: {len(b10)} x 10-min  |  {len(b3)} x 3-min bars loaded  trend={self.trend[symbol]}")
 
     # ──────────────────────────────────────────────────────────────────────
+    # 1-min position management — ratchet + stop every minute while in trade
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _refresh_bars_1m(self):
+        """Re-request 1-min bars for open positions and run management checks.
+        Called every minute when a position is live.  No entry signals here.
+        """
+        for symbol in list(self.positions.keys()):
+            pos = self.positions.get(symbol)
+            if not pos or not pos.is_open:
+                continue
+            try:
+                contract = Stock(symbol, "SMART", "USD")
+                self.ib.qualifyContracts(contract)
+                bars_1m = self.ib.reqHistoricalData(
+                    contract, endDateTime="", durationStr="1 D",
+                    barSizeSetting="1 min", whatToShow="TRADES",
+                    useRTH=True, keepUpToDate=False,
+                )
+                if bars_1m:
+                    self._on_new_bar_1m(symbol, bars_1m)
+            except Exception as e:
+                log.warning(f"  {symbol}: 1m management refresh error — {e}")
+
+    def _on_new_bar_1m(self, symbol: str, bars_1m):
+        """1-min position management: ratchet update + stop check.
+        Does NOT check entry signals, RVOL, or cloud direction — those stay
+        at the 3-min bar so they're based on confirmed bar closes.
+
+        Ordering (anti-phantom guarantee):
+          1. Update trailing stop with PREVIOUS best_unrealised
+          2. Check if stop was hit
+          3. Update best_unrealised with this bar's extreme — AFTER the stop check
+             so the same bar that raises the ratchet floor can't immediately hit it.
+        """
+        pos = self.positions.get(symbol)
+        if not pos or not pos.is_open:
+            return
+
+        now    = datetime.now()
+        cur_1m = bars_1m[-1]   # most recent 1-min bar — raw bar object
+
+        # ema50 from the last 3-min computation (close enough for the ratchet
+        # floor — recomputing EMAs on 1-min bars every minute is unnecessary).
+        df_3m = compute_emas(list(self.bars_3m[symbol]))
+
+        # Step 1 — Update trailing stop using PREVIOUS best_unrealised
+        new_stop = compute_trailing_stop(
+            df_3m, pos.direction, pos.stop_price, pos.entry_price,
+            best_unrealised=pos.best_unrealised)
+        pos.update_stop(new_stop)
+
+        # Step 2 — Half-exit at Rip's level or profit target (1-min resolution)
+        # Mirrors the logic in _on_new_bar_3m but fires on 1-min bar highs/lows
+        # so we don't wait 3 minutes to take profit at a level that was touched.
+        if not pos.half_exited:
+            half_px  = None
+            half_rsn = "half@level"
+
+            if pos.direction == "long" and pos.level_res is not None:
+                if cur_1m.high >= pos.level_res:
+                    half_px = pos.level_res
+            elif pos.direction == "short" and pos.level_sup is not None:
+                if cur_1m.low <= pos.level_sup:
+                    half_px = pos.level_sup
+
+            # Profit target fallback when no usable level is ahead of entry
+            if pos.direction == "long":
+                level_still_ahead = (pos.level_res is not None
+                                     and pos.level_res > pos.entry_price)
+            else:
+                level_still_ahead = (pos.level_sup is not None
+                                     and pos.level_sup < pos.entry_price)
+            unr_1m = (cur_1m.close - pos.entry_price if pos.direction == "long"
+                      else pos.entry_price - cur_1m.close)
+            if half_px is None and not level_still_ahead and unr_1m >= PROFIT_TARGET_SHARE:
+                half_px  = cur_1m.close
+                half_rsn = "half@target"
+
+            if half_px is not None:
+                half_sh  = pos.shares // 2
+                half_pnl = ((half_px - pos.entry_price) * half_sh
+                            if pos.direction == "long"
+                            else (pos.entry_price - half_px) * half_sh)
+                if half_pnl > 0 and half_sh > 0:
+                    self._close_partial(symbol, half_sh, half_px, now,
+                                        reason=half_rsn)
+                    pos.shares -= half_sh
+                pos.half_exited = True   # block re-fire even if pnl was 0
+
+        # Step 3 — Hard stop check using 1-min low/high
+        if pos.direction == "long" and cur_1m.low <= pos.stop_price:
+            tlog.info(
+                f"1M STOP  LONG  {symbol}  stop=${pos.stop_price:.2f}"
+                f"  (1m low=${cur_1m.low:.2f})  {now.strftime('%H:%M')}"
+            )
+            self._close_position(symbol, pos.stop_price, now, "stop")
+            return
+        if pos.direction == "short" and cur_1m.high >= pos.stop_price:
+            tlog.info(
+                f"1M STOP  SHORT {symbol}  stop=${pos.stop_price:.2f}"
+                f"  (1m high=${cur_1m.high:.2f})  {now.strftime('%H:%M')}"
+            )
+            self._close_position(symbol, pos.stop_price, now, "stop")
+            return
+
+        # Step 3 — Update HWM with this bar's extreme (AFTER stop check)
+        if pos.direction == "long":
+            peak_unr = cur_1m.high - pos.entry_price
+        else:
+            peak_unr = pos.entry_price - cur_1m.low
+        pos.best_unrealised = max(pos.best_unrealised, peak_unr)
+
+        # Compact 1-min status line
+        unr_px  = cur_1m.close - pos.entry_price if pos.direction == "long" \
+                  else pos.entry_price - cur_1m.close
+        sign    = "+" if unr_px >= 0 else ""
+        locked  = (" [LOCKED]"
+                   if (pos.direction == "long"  and pos.stop_price > pos.entry_price) or
+                      (pos.direction == "short" and pos.stop_price < pos.entry_price)
+                   else "")
+        print(
+            f"  {now.strftime('%H:%M')}  1m {pos.direction.upper()} {symbol}"
+            f"  px={cur_1m.close:.2f}"
+            f"  PnL={sign}${unr_px * pos.shares:.0f}"
+            f"  stop={pos.stop_price:.2f}"
+            f"  HWM=+${pos.best_unrealised:.2f}{locked}"
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
     # Bar refresh — re-request fresh data at each bar boundary
     # ──────────────────────────────────────────────────────────────────────
 
@@ -749,6 +879,7 @@ class TradingBot:
         #   10-min bars: minute divisible by 10 (9:40, 9:50, 10:00, ...)
         last_3m_id  = -1   # bar-close ID already processed for 3m
         last_10m_id = -1   # bar-close ID already processed for 10m
+        last_1m_id  = -1   # bar-close ID already processed for 1m position management
 
         while True:
             self.ib.sleep(1)
@@ -758,6 +889,17 @@ class TradingBot:
                 break
 
             now = datetime.now()
+
+            # ── 1-min position management ─────────────────────────────────
+            # Only fires when we're in a trade.  Ratchet + stop check every
+            # minute so we don't give back intrabar gains.  No entry logic.
+            bar_1m_id = now.hour * 100 + now.minute
+            if bar_1m_id != last_1m_id and now.second <= 5 and self.positions:
+                last_1m_id = bar_1m_id
+                # Skip if this minute is also the 3-min bar close — the
+                # 3-min handler will run immediately after and covers it.
+                if now.minute % 3 != 0:
+                    self._refresh_bars_1m()
 
             # ── 3-min bar close detector ──────────────────────────────────
             # Bars close when clock-minute is divisible by 3, within first 5s
