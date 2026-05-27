@@ -14,8 +14,11 @@ All entry/exit logic mirrors week_backtest.py exactly:
   - 10-min fast cloud exit
   - 1 trade per symbol per direction per day after a loss
 """
+import collections
+import json
 import logging
 import os
+import pathlib
 from datetime import datetime, date
 from typing import Optional
 
@@ -72,16 +75,18 @@ tlog = _setup_trade_logger()
 def _entry_order(action: str, quantity: int) -> Order:
     """Entry order — Midprice on live (fills at bid/ask midpoint, saves spread),
     plain MarketOrder on paper (Midprice not needed in simulation).
-    Exits always use MarketOrder so they are guaranteed to fill."""
+    Exits always use MarketOrder so they are guaranteed to fill.
+    tif='DAY' set explicitly on both paths so the TWS order preset never needs
+    to override it (error 10349 — preset TIF override cancels the order)."""
+    o = Order()
+    o.action        = action
+    o.totalQuantity = quantity
+    o.tif           = "DAY"
     if TWS_PORT == 7496:   # live account
-        o = Order()
-        o.action        = action
-        o.totalQuantity = quantity
-        o.orderType     = "MIDPRICE"
-        o.tif           = "DAY"
-        return o
-    else:                  # paper account (7497) — market order
-        return MarketOrder(action, quantity)
+        o.orderType = "MIDPRICE"
+    else:                  # paper account (7497)
+        o.orderType = "MKT"
+    return o
 
 
 class TradingBot:
@@ -103,14 +108,26 @@ class TradingBot:
         self.positions: dict[str, Position] = {}
         self.trade_log: list[dict]          = []   # all completed trade events
 
-        self._trades_today:   dict = {s: 0    for s in self.symbols}
-        self._lost_dir_today: dict = {s: None for s in self.symbols}
+        self._trades_today:   dict = {s: 0 for s in self.symbols}
         self._last_trade_date      = None
 
         # Protective STP orders placed in TWS at entry — crash backstop.
         # If the bot crashes mid-trade, TWS closes the position at the initial stop.
         # Cancelled automatically when bot exits the position normally.
         self._twss_stop_orders: dict = {}  # symbol -> ib_insync Order object
+
+        # Orders placed but not yet fill-confirmed.  Position object is created
+        # inside the fillEvent callback — never before — so a cancelled entry
+        # never creates a ghost position.  Also counted toward the slot limit.
+        self._pending_entries: dict = {}   # symbol -> metadata dict
+
+        # Real-time market data tickers — one per symbol, requested at startup.
+        # (a) Activates market data subscription → IBKR error 354 goes away.
+        # (b) Unlocks non-delayed reqHistoricalData — paper accounts serve
+        #     15-min delayed bars without an active subscription; with one, bars
+        #     come in real-time.
+        # (c) Gives us a live last-price feed for second-by-second stop checks.
+        self.tickers: dict = {}            # symbol -> ib_insync Ticker
 
         # Pre-market high / low per symbol — used for PMH/PML breakout signals
         self.pmh: dict = {s: None for s in self.symbols}
@@ -125,6 +142,14 @@ class TradingBot:
         log.info("Connected to IBKR TWS  (port %s)", TWS_PORT)
 
     def disconnect(self):
+        # Cancel all streaming market data subscriptions before disconnecting.
+        for symbol in self.symbols:
+            if symbol in self.tickers:
+                try:
+                    contract = Stock(symbol, "SMART", "USD")
+                    self.ib.cancelMktData(contract)
+                except Exception:
+                    pass
         self.ib.disconnect()
         log.info("Disconnected from IBKR TWS")
 
@@ -141,6 +166,15 @@ class TradingBot:
             contract = Stock(symbol, "SMART", "USD")
             self.ib.qualifyContracts(contract)
             self.trend[symbol] = "none"
+
+            # Subscribe to real-time market data BEFORE requesting historical bars.
+            # With an active subscription, IBKR serves non-delayed historical data
+            # on paper accounts.  Also satisfies the error-354 precautionary check
+            # so orders go through without "no market data" rejection.
+            # genericTickList='' = default tick types (bid/ask/last/volume/close)
+            ticker = self.ib.reqMktData(contract, '', False, False)
+            self.tickers[symbol] = ticker
+            self.ib.sleep(0.2)   # let subscription register before hist requests
 
             b10 = self.ib.reqHistoricalData(
                 contract, endDateTime="", durationStr="20 D",
@@ -313,6 +347,25 @@ class TradingBot:
         )
 
     # ──────────────────────────────────────────────────────────────────────
+    # Real-time price helper
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _rt_price(self, symbol: str):
+        """Best available real-time last price for a symbol.
+        Returns None when the ticker hasn't received data yet (e.g. pre-market
+        before the first trade).  Falls back to bid/ask midpoint."""
+        t = self.tickers.get(symbol)
+        if t is None:
+            return None
+        px = t.last
+        if px and px == px:   # not None, not NaN (NaN != NaN is True)
+            return px
+        mid = t.midpoint()
+        if mid and mid == mid:
+            return mid
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────
     # Bar refresh — re-request fresh data at each bar boundary
     # ──────────────────────────────────────────────────────────────────────
 
@@ -419,8 +472,7 @@ class TradingBot:
 
         # Reset daily counters on new trading day
         if today != self._last_trade_date:
-            self._trades_today   = {s: 0    for s in self.symbols}
-            self._lost_dir_today = {s: None for s in self.symbols}
+            self._trades_today    = {s: 0 for s in self.symbols}
             self._last_trade_date = today
             tlog.info("=" * 55 + f"  {today}")
 
@@ -538,7 +590,9 @@ class TradingBot:
         # ─────────────────────────────────────────────────────────────────
         # ENTRY CHECKS
         # ─────────────────────────────────────────────────────────────────
-        if len(self.positions) >= MAX_SIMULTANEOUS_POSITIONS:
+        # Count pending (order placed, awaiting fill) toward the slot limit
+        # so we don't fire a second entry while the first is still in-flight.
+        if len(self.positions) + len(self._pending_entries) >= MAX_SIMULTANEOUS_POSITIONS:
             return
         if self._trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return
@@ -631,11 +685,6 @@ class TradingBot:
                         f"  px=${_c.close:.2f}  e50=${_c.ema50:.2f}"
                     )
             return
-        if signal == self._lost_dir_today.get(symbol):
-            if DEBUG_SIGNALS:
-                tlog.info(f"BLOCKED  {symbol}  {signal.upper()}  [lost same direction today]")
-            return   # blocked after same-direction loss today
-
         entry_price = cur.close
         stop_dist   = abs(entry_price - stop_price)
 
@@ -714,28 +763,73 @@ class TradingBot:
                        entry_reason: str = "",
                        level_res: Optional[float] = None,
                        level_sup: Optional[float] = None):
+        """Place the entry order and register fill/cancel callbacks.
+
+        The Position object is created ONLY inside the fillEvent callback —
+        never immediately after placeOrder.  This prevents ghost positions
+        when TWS cancels the order (error 10349, 354, etc.).
+        """
         action   = "BUY" if direction == "long" else "SELL"
         contract = Stock(symbol, "SMART", "USD")
         self.ib.qualifyContracts(contract)
-        order = self.ib.placeOrder(contract, _entry_order(action, shares))
-
-        pos = Position(
-            symbol=symbol, direction=direction, shares=shares,
-            entry_price=entry_price, entry_time=time, stop_price=stop_price,
-            ibkr_order_id=order.order.orderId,
-            entry_signal=entry_reason,
-            level_res=level_res, level_sup=level_sup,
-        )
-        self.positions[symbol] = pos
+        trade = self.ib.placeOrder(contract, _entry_order(action, shares))
         log.info(f"  ORDER: {action} {shares}x {symbol}  "
-                 f"(order #{order.order.orderId}  ~${entry_price:.2f})")
+                 f"(order #{trade.order.orderId}  ~${entry_price:.2f})")
 
-        # Place a protective STP order in TWS as a crash backstop.
-        # If the bot crashes while in a trade, TWS closes the position at
-        # the initial stop — preventing an unmanaged open position overnight.
-        # The bot cancels this order automatically on any normal exit.
+        # Park metadata — Position is built in _on_fill, not here.
+        self._pending_entries[symbol] = {
+            "direction":    direction,
+            "shares":       shares,
+            "entry_price":  entry_price,   # signal-bar close (estimate)
+            "stop_price":   stop_price,
+            "time":         time,
+            "entry_reason": entry_reason,
+            "level_res":    level_res,
+            "level_sup":    level_sup,
+            "contract":     contract,
+        }
+
+        def _on_fill(t, fill):
+            if symbol not in self._pending_entries:
+                return   # partial-fill re-fire guard
+            info     = self._pending_entries.pop(symbol)
+            actual_px = fill.execution.avgPrice
+            pos = Position(
+                symbol=symbol,
+                direction=info["direction"],
+                shares=info["shares"],
+                entry_price=actual_px,
+                entry_time=info["time"],
+                stop_price=info["stop_price"],
+                ibkr_order_id=t.order.orderId,
+                entry_signal=info["entry_reason"],
+                level_res=info["level_res"],
+                level_sup=info["level_sup"],
+            )
+            self.positions[symbol] = pos
+            log.info(f"  FILLED: {action} {info['shares']}x {symbol}  @${actual_px:.2f}")
+            # Crash stop placed only after confirmed fill — no phantom stops.
+            self._place_crash_stop(symbol, info["contract"],
+                                   info["direction"], info["shares"], info["stop_price"])
+
+        def _on_cancelled(t):
+            removed = self._pending_entries.pop(symbol, None)
+            if removed is not None:
+                log.warning(f"  {symbol}: entry order cancelled — no position opened  "
+                            f"(order #{t.order.orderId})")
+
+        trade.fillEvent      += _on_fill
+        trade.cancelledEvent += _on_cancelled
+
+    def _place_crash_stop(self, symbol: str, contract,
+                          direction: str, shares: int, stop_price: float):
+        """Place TWS crash-backstop STP after a confirmed fill.
+        If the bot crashes mid-trade, TWS closes the position at the initial
+        stop — preventing an unmanaged overnight position.
+        Cancelled automatically by _close_position on any normal exit.
+        """
         _crash_action = "SELL" if direction == "long" else "BUY"
-        _stop_ord = Order()
+        _stop_ord               = Order()
         _stop_ord.action        = _crash_action
         _stop_ord.totalQuantity = shares
         _stop_ord.orderType     = "STP"
@@ -757,7 +851,7 @@ class TradingBot:
         action = "SELL" if pos.direction == "long" else "BUY"
         contract = Stock(symbol, "SMART", "USD")
         self.ib.qualifyContracts(contract)
-        self.ib.placeOrder(contract, MarketOrder(action, shares))
+        self.ib.placeOrder(contract, _entry_order(action, shares))
 
         # Keep crash-stop quantity in sync with remaining shares.
         # Without this, the crash stop would try to sell the full original
@@ -802,7 +896,7 @@ class TradingBot:
         action   = "SELL" if pos.direction == "long" else "BUY"
         contract = Stock(symbol, "SMART", "USD")
         self.ib.qualifyContracts(contract)
-        self.ib.placeOrder(contract, MarketOrder(action, pos.shares))
+        self.ib.placeOrder(contract, _entry_order(action, pos.shares))
 
         pos.close(price, time, reason)
         pnl    = pos.pnl or 0.0
@@ -817,13 +911,6 @@ class TradingBot:
         )
 
         self._trades_today[symbol] += 1
-        # Only block re-entries after a meaningful loss — scratches ($50 or less)
-        # are often premature exits, not wrong direction calls.
-        if pnl < -50:
-            self._lost_dir_today[symbol] = pos.direction
-            tlog.info(
-                f"  BLOCK  {symbol}  {pos.direction.upper()} re-entries today (loss ${pnl:.0f})"
-            )
 
         self.trade_log.append({
             "time":         time.strftime("%H:%M:%S"),
@@ -851,6 +938,93 @@ class TradingBot:
                 log.warning(f"  {symbol}: crash stop cancel failed — {_e}")
 
         del self.positions[symbol]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Hot-add a symbol mid-session
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _hot_add_symbol(self, symbol: str,
+                        support=None, resistance=None):
+        """Load a new symbol into the watchlist while the bot is running.
+        Called when hot_add.json appears in the working directory.
+        Runs the same ATR check, bar load, and trend init as subscribe_bars().
+        """
+        symbol = symbol.upper().strip()
+        if symbol in self.symbols:
+            log.warning(f"HOT-ADD {symbol}: already in watchlist — skipped")
+            return
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+
+            # Real-time data subscription first (same reason as subscribe_bars)
+            ticker = self.ib.reqMktData(contract, '', False, False)
+            self.tickers[symbol] = ticker
+            self.ib.sleep(0.2)
+
+            # 10-min history for ATR check + trend
+            b10 = self.ib.reqHistoricalData(
+                contract, endDateTime="", durationStr="20 D",
+                barSizeSetting=BAR_SIZE_10M, whatToShow="TRADES",
+                useRTH=True, keepUpToDate=False,
+            )
+            if not b10:
+                log.warning(f"HOT-ADD {symbol}: no 10m bar data — skipped")
+                return
+
+            day_hi: dict = collections.defaultdict(float)
+            day_lo: dict = collections.defaultdict(lambda: float("inf"))
+            for bar in b10:
+                d = bar.date.date() if hasattr(bar.date, "date") else bar.date
+                day_hi[d] = max(day_hi[d], bar.high)
+                day_lo[d] = min(day_lo[d], bar.low)
+            recent_days = sorted(day_hi)[-5:]
+            avg_range = sum(day_hi[d] - day_lo[d] for d in recent_days) / len(recent_days)
+
+            if avg_range < MIN_DAILY_RANGE:
+                log.warning(
+                    f"HOT-ADD {symbol}: ATR ${avg_range:.2f} < min ${MIN_DAILY_RANGE:.0f} — skipped"
+                )
+                return
+
+            self._sym_atr[symbol] = avg_range
+            dtr_tag = " (DTR exempt)" if avg_range >= DTR_EXEMPT_ATR else ""
+
+            # 3-min history for entry signals
+            b3 = self.ib.reqHistoricalData(
+                contract, endDateTime="", durationStr="3 D",
+                barSizeSetting=BAR_SIZE_3M, whatToShow="TRADES",
+                useRTH=True, keepUpToDate=False,
+            )
+            if not b3:
+                log.warning(f"HOT-ADD {symbol}: no 3m bar data — skipped")
+                return
+
+            # Wire up all state
+            self.bars_10m[symbol]         = b10
+            self.bars_3m[symbol]          = b3
+            self.trend[symbol]            = "none"
+            self.plan[symbol]             = {"support": support, "resistance": resistance}
+            self.pmh[symbol]              = None   # no pre-market data mid-session
+            self.pml[symbol]              = None
+            self._trades_today[symbol]    = 0
+            self.symbols.append(symbol)
+
+            self._on_new_bar_10m(symbol, b10)   # set initial trend
+
+            log.info(
+                f"HOT-ADD  {symbol}  ATR=${avg_range:.2f}{dtr_tag}"
+                f"  trend={self.trend[symbol]}"
+                f"  sup={support}  res={resistance}"
+            )
+            tlog.info(
+                f"HOT-ADD  {symbol}  ATR=${avg_range:.2f}"
+                f"  trend={self.trend[symbol]}"
+                f"  sup={support}  res={resistance}"
+            )
+
+        except Exception as e:
+            log.error(f"HOT-ADD {symbol} failed: {e}", exc_info=True)
 
     # ──────────────────────────────────────────────────────────────────────
     # Run
@@ -889,6 +1063,70 @@ class TradingBot:
                 break
 
             now = datetime.now()
+
+            # ── Hot-add check (fires every second) ────────────────────────
+            # Drop hot_add.json in the bot directory from a second terminal:
+            #   python add_symbol.py NVDA 120.00 125.00
+            _hot_path = pathlib.Path("hot_add.json")
+            if _hot_path.exists():
+                try:
+                    _data = json.loads(_hot_path.read_text())
+                    _sym  = _data.get("symbol", "").upper().strip()
+                    if _sym:
+                        self._hot_add_symbol(
+                            _sym,
+                            support=_data.get("support"),
+                            resistance=_data.get("resistance"),
+                        )
+                except Exception as _e:
+                    log.warning(f"hot_add.json error: {_e}")
+                finally:
+                    _hot_path.unlink(missing_ok=True)
+
+            # ── Real-time stop + half-exit check (fires every second) ─────
+            # Uses live ticker last-price — no bar delay.
+            # This is the primary stop-loss mechanism now that reqMktData is
+            # active.  The 1-min bar handler still updates the ratchet (needs
+            # EMA50 from the 3-min bars) but the hard exit fires here first.
+            for _sym in list(self.positions.keys()):
+                _pos = self.positions.get(_sym)
+                if not _pos or not _pos.is_open:
+                    continue
+                _rt = self._rt_price(_sym)
+                if _rt is None:
+                    continue
+
+                # Half-exit at Rip's level — real-time resolution
+                if not _pos.half_exited:
+                    _half_px = None
+                    if _pos.direction == "long" and _pos.level_res and _rt >= _pos.level_res:
+                        _half_px = _pos.level_res
+                    elif _pos.direction == "short" and _pos.level_sup and _rt <= _pos.level_sup:
+                        _half_px = _pos.level_sup
+                    if _half_px is not None:
+                        _half_sh  = _pos.shares // 2
+                        _half_pnl = ((_half_px - _pos.entry_price) * _half_sh
+                                     if _pos.direction == "long"
+                                     else (_pos.entry_price - _half_px) * _half_sh)
+                        if _half_pnl > 0 and _half_sh > 0:
+                            self._close_partial(_sym, _half_sh, _half_px, now,
+                                                reason="half@level_rt")
+                            _pos.shares -= _half_sh
+                        _pos.half_exited = True
+
+                # Hard stop — exit immediately if real-time price crosses stop
+                if _pos.direction == "long" and _rt <= _pos.stop_price:
+                    tlog.info(
+                        f"RT STOP  LONG  {_sym}  last=${_rt:.2f}"
+                        f"  stop=${_pos.stop_price:.2f}  {now.strftime('%H:%M:%S')}"
+                    )
+                    self._close_position(_sym, _pos.stop_price, now, "stop_rt")
+                elif _pos.direction == "short" and _rt >= _pos.stop_price:
+                    tlog.info(
+                        f"RT STOP  SHORT {_sym}  last=${_rt:.2f}"
+                        f"  stop=${_pos.stop_price:.2f}  {now.strftime('%H:%M:%S')}"
+                    )
+                    self._close_position(_sym, _pos.stop_price, now, "stop_rt")
 
             # ── 1-min position management ─────────────────────────────────
             # Only fires when we're in a trade.  Ratchet + stop check every

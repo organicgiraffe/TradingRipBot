@@ -1,0 +1,120 @@
+//@version=6
+indicator("TW-Style Blue/Pink Smart Candles Approx", overlay=true, max_labels_count=100)
+
+// This is an original approximation for visual/manual chart review.
+// It does not copy or unlock any paid/proprietary TradingView script.
+
+bbLen = input.int(20, "Bollinger Length", minval=5)
+bbMult = input.float(2.0, "Bollinger Mult", minval=0.5, step=0.25)
+volLen = input.int(20, "Relative Volume Length", minval=5)
+peakLen = input.int(120, "Volume Peak Lookback", minval=20)
+triggerScore = input.float(3.0, "Blue/Pink Trigger Score", minval=1.0, step=0.25)
+trendScore = input.float(2.0, "Green/Red Continuation Score", minval=0.5, step=0.25)
+watchScore = input.float(1.0, "Watch Color Score", minval=0.25, step=0.25)
+showLevels = input.bool(false, "Show BB Mid + Volume Peak")
+showSignals = input.bool(false, "Show Signal Markers")
+showOnlyTriggers = input.bool(false, "Color Only Blue/Pink Triggers")
+
+ema8 = ta.ema(close, 8)
+ema21 = ta.ema(close, 21)
+sma50 = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+
+bbMid = ta.sma(close, bbLen)
+bbDev = ta.stdev(close, bbLen) * bbMult
+bbUpper = bbMid + bbDev
+bbLower = bbMid - bbDev
+
+rsi14 = ta.rsi(close, 14)
+rvol = volume / ta.sma(volume, volLen)
+
+// Volume peak proxy:
+// True volume profile is not available in simple Pine without heavier arrays,
+// so this tracks the price of the highest-volume candle in the recent window.
+highestVol = ta.highest(volume, peakLen)
+volumePeak = ta.valuewhen(volume == highestVol, hlc3, 0)
+
+midSlope = bbMid - bbMid[5]
+upCandle = close >= open
+downCandle = close <= open
+
+bullScore = 0.0
+bullScore += close > bbMid ? 1.0 : 0.0
+bullScore += ema8 > ema21 ? 1.0 : 0.0
+bullScore += close > sma50 ? 1.0 : 0.0
+bullScore += close > sma200 ? 0.5 : 0.0
+bullScore += close > volumePeak ? 1.0 : 0.0
+bullScore += rsi14 > 52 ? 1.0 : 0.0
+bullScore += midSlope > 0 ? 0.5 : 0.0
+bullScore += rvol > 1.1 and upCandle ? 0.75 : 0.0
+bullScore += close > close[1] ? 0.5 : 0.0
+
+bearScore = 0.0
+bearScore += close < bbMid ? 1.0 : 0.0
+bearScore += ema8 < ema21 ? 1.0 : 0.0
+bearScore += close < sma50 ? 1.0 : 0.0
+bearScore += close < sma200 ? 0.5 : 0.0
+bearScore += close < volumePeak ? 1.0 : 0.0
+bearScore += rsi14 < 48 ? 1.0 : 0.0
+bearScore += midSlope < 0 ? 0.5 : 0.0
+bearScore += rvol > 1.1 and downCandle ? 0.75 : 0.0
+bearScore += close < close[1] ? 0.5 : 0.0
+
+score = bullScore - bearScore
+ready = bar_index > math.max(peakLen, 200)
+
+crossUpMid = ta.crossover(close, bbMid)
+crossUpPeak = ta.crossover(close, volumePeak)
+crossDownMid = ta.crossunder(close, bbMid)
+crossDownPeak = ta.crossunder(close, volumePeak)
+crossUp = crossUpMid or crossUpPeak
+crossDown = crossDownMid or crossDownPeak
+
+blue = ready and score >= triggerScore and (score[1] < triggerScore or crossUp)
+pink = ready and score <= -triggerScore and (score[1] > -triggerScore or crossDown)
+
+green = ready and not blue and score >= trendScore
+red = ready and not pink and score <= -trendScore
+
+blueGreen = ready and not blue and not green and score >= watchScore
+pinkRed = ready and not pink and not red and score <= -watchScore
+
+rangeSafe = math.max(high - low, syminfo.mintick)
+upperWickPct = (high - math.max(open, close)) / rangeSafe
+recentRun = close / ta.lowest(close, 10) - 1.0
+roc3 = ta.roc(close, 3)
+
+trim = ready and score > watchScore and
+     (recentRun >= 0.12 or close >= bbUpper or rsi14 >= 70) and
+     (close < close[1] or roc3 < 0 or upperWickPct > 0.35)
+
+cBlue = color.rgb(0, 130, 255)
+cGreen = color.rgb(0, 170, 85)
+cBlueGreen = color.rgb(0, 205, 170)
+cPink = color.rgb(255, 140, 0)
+cRed = color.rgb(215, 35, 55)
+cPinkRed = color.rgb(230, 90, 125)
+cTrim = color.rgb(255, 175, 35)
+
+barCol = trim ? cTrim :
+     blue ? cBlue :
+     pink ? cPink :
+     showOnlyTriggers ? na :
+     green ? cGreen :
+     red ? cRed :
+     blueGreen ? cBlueGreen :
+     pinkRed ? cPinkRed :
+     na
+
+barcolor(barCol)
+
+plot(showLevels ? bbMid : na, "BB Mid", color=color.new(color.yellow, 30), linewidth=1)
+plot(showLevels ? volumePeak : na, "Volume Peak Proxy", color=color.new(color.purple, 30), linewidth=1, style=plot.style_linebr)
+
+plotshape(showSignals and blue, title="Blue Buy", style=shape.triangleup, location=location.belowbar, color=cBlue, size=size.tiny)
+plotshape(showSignals and pink, title="Pink Sell", style=shape.triangledown, location=location.abovebar, color=cPink, size=size.tiny)
+plotshape(showSignals and trim, title="Trim", style=shape.xcross, location=location.abovebar, color=cTrim, size=size.tiny)
+
+alertcondition(blue, "Blue Buy Trigger", "{{ticker}} blue smart-candle buy trigger")
+alertcondition(pink, "Pink Sell Trigger", "{{ticker}} pink smart-candle sell trigger")
+alertcondition(trim, "Trim Warning", "{{ticker}} trim warning")

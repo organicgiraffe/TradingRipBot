@@ -99,8 +99,7 @@ print(f"  BACKTEST  --  {TODAY}  --  1 global trade at a time  ({mode})")
 print(f"{'='*78}\n")
 print("  Downloading data...", end="", flush=True)
 
-sym_data   = {}   # sym -> (bars3_all, bars10_all, today3, shares)
-lost_dir   = {}   # sym -> direction blocked today after >$50 loss
+sym_data     = {}   # sym -> (bars3_all, bars10_all, today3, shares)
 trades_today = {}
 sym_atr    = {}   # sym -> 5-day avg daily range ($) — used for priority scoring
 
@@ -125,8 +124,7 @@ for sym, lev in PLAN.items():
     if atr < MIN_DAILY_RANGE:
         skipped_atr[sym] = atr
         continue   # too low ATR — not worth trading
-    sym_data[sym] = (b3, b10, t3, sh, pmh, pml, df1_today)
-    lost_dir[sym] = None
+    sym_data[sym]     = (b3, b10, t3, sh, pmh, pml, df1_today)
     trades_today[sym] = 0
 
 print(f" done ({len(sym_data)} active, {len(skipped_atr)} skipped)\n")
@@ -249,8 +247,6 @@ for bt in all_times:
                 "held": held_m, "peak": t["peak_unr"],
             })
             trades_today[sym] += 1
-            if total < -50:
-                lost_dir[sym] = sig
             in_trade   = False
             open_trade = None
         continue   # done managing — don't look for new entries this bar
@@ -293,7 +289,6 @@ for bt in all_times:
                 df3e, trend, bar_time=bt.to_pydatetime(),
                 support=sup, resistance=res)
         if sig == "none": continue
-        if sig == lost_dir[sym]: continue
 
         entry     = df3e.iloc[-1].close
         stop_dist = abs(entry - stop_px)

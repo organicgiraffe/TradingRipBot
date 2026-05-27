@@ -45,30 +45,35 @@ log = logging.getLogger(__name__)
 
 
 def _compute_atr(sym: str) -> float | None:
-    """5-day avg daily range via yfinance 1-min bars. Returns None on failure."""
-    try:
-        df = yf.download(sym, period="5d", interval="1m",
-                         auto_adjust=True, progress=False)
-        if df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0].lower() for c in df.columns]
-        else:
-            df.columns = [c.lower() for c in df.columns]
-        df.index = pd.to_datetime(df.index)
-        df.index = (df.index.tz_convert("America/New_York")
-                    if df.index.tz else df.index.tz_localize("America/New_York"))
-        df = df.between_time("09:30", "15:59")
-        hi = collections.defaultdict(float)
-        lo = collections.defaultdict(lambda: float("inf"))
-        for ts, row in df.iterrows():
-            d = ts.date()
-            hi[d] = max(hi[d], row["high"])
-            lo[d] = min(lo[d], row["low"])
-        days = sorted(hi)[-5:]
-        return round(sum(hi[d] - lo[d] for d in days) / len(days), 2) if days else None
-    except Exception:
-        return None
+    """5-day avg daily range via yfinance 1-min bars. Returns None on failure.
+    Falls back to 5-min bars (period=60d) if 1-min data is unavailable.
+    """
+    for period, interval in [("5d", "1m"), ("60d", "5m")]:
+        try:
+            df = yf.download(sym, period=period, interval=interval,
+                             auto_adjust=True, progress=False)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0].lower() for c in df.columns]
+            else:
+                df.columns = [c.lower() for c in df.columns]
+            df.index = pd.to_datetime(df.index)
+            df.index = (df.index.tz_convert("America/New_York")
+                        if df.index.tz else df.index.tz_localize("America/New_York"))
+            df = df.between_time("09:30", "15:59")
+            hi = collections.defaultdict(float)
+            lo = collections.defaultdict(lambda: float("inf"))
+            for ts, row in df.iterrows():
+                d = ts.date()
+                hi[d] = max(hi[d], row["high"])
+                lo[d] = min(lo[d], row["low"])
+            days = sorted(hi)[-5:]
+            if days:
+                return round(sum(hi[d] - lo[d] for d in days) / len(days), 2)
+        except Exception:
+            continue
+    return None
 
 
 def get_startup_inputs() -> tuple[list[str], dict]:
@@ -98,13 +103,30 @@ def get_startup_inputs() -> tuple[list[str], dict]:
             print(f"    {sym:<6}  ATR=${atr:.2f}  SKIP  (< ${MIN_DAILY_RANGE:.0f})")
             dropped.append(sym)
         else:
-            sh = FIXED_SHARES_HIGH if atr_map[sym] > HIGH_PRICE_THRESHOLD else FIXED_SHARES
             print(f"    {sym:<6}  ATR=${atr:.2f}  OK")
             passed.append(sym)
 
     if not passed:
-        print("\n  No symbols passed the ATR filter. Exiting.")
-        sys.exit(1)
+        print("\n  No symbols passed the ATR filter (yfinance may be down).")
+        override = input("  Override — enter ATRs manually? (y/n): ").strip().lower()
+        if override != "y":
+            sys.exit(1)
+        for sym in all_syms:
+            try:
+                val = input(f"    {sym} ATR ($): ").strip()
+                atr = float(val)
+                atr_map[sym] = atr
+                if atr >= MIN_DAILY_RANGE:
+                    passed.append(sym)
+                    print(f"    {sym:<6}  ATR=${atr:.2f}  OK  (manual)")
+                else:
+                    dropped.append(sym)
+                    print(f"    {sym:<6}  ATR=${atr:.2f}  SKIP")
+            except ValueError:
+                dropped.append(sym)
+        if not passed:
+            print("  Still no symbols. Exiting.")
+            sys.exit(1)
 
     # Sort passed symbols by ATR descending — highest movers evaluated first
     passed.sort(key=lambda s: atr_map[s], reverse=True)

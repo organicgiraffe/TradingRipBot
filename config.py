@@ -32,7 +32,7 @@ RATCHET_GIVEBACK     = 2.0    # max $ that can be given back once ratchet is act
                                # tighter than $3 — works alongside the half-exit at level
 MAX_STOP_PCT         = 0.025  # skip trade if stop is farther than 2.5% of entry price
 MAX_STOP_DISTANCE    = 5.00   # legacy dollar cap — now secondary to MAX_STOP_PCT
-MAX_TRADES_PER_DAY   = 1      # one clean trade per symbol per day; second trades are consistent losers
+MAX_TRADES_PER_DAY   = 2      # up to 2 entries per symbol per day — allows re-entry on a fresh setup
 VOLUME_CONFIRM_MULT  = 0.8    # signal candle volume must be > 0.8x 20-bar avg (80% of average)
 RVOL_EXIT_MULT       = 0.3    # exit when 3m bar volume drops below 30% of avg — truly dead
 MAX_RISK_PER_TRADE   = 200.0  # max $ at risk per trade — shares are sized dynamically
