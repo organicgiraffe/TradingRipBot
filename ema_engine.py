@@ -5,6 +5,8 @@ from config import (EMA_PERIODS, MIN_BARS_10M, MIN_BARS_3M,
                     VOLUME_CONFIRM_MULT,
                     CLOUD_EXIT_BUFFER, GAP_THRESHOLD,
                     MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE,
+                    GAP_ENTRY_START_HOUR, GAP_ENTRY_START_MINUTE,
+                    GAP_ENTRY_END_HOUR, GAP_ENTRY_END_MINUTE,
                     LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE,
                     FRIDAY_OPEN_MINUTE,
                     RVOL_EXIT_MULT,
@@ -204,6 +206,55 @@ def get_trend_10m(df_10m: pd.DataFrame) -> str:
     if _both_bear(cur) and _both_bear(prev) and cur.hl2 < cur.ema200:
         return "bearish"
     return "none"
+
+
+# ------------------------------------------------------------------ #
+# Opening-drive gap model
+# ------------------------------------------------------------------ #
+
+def _in_gap_entry_window(bar_time) -> bool:
+    """True for completed bars from 09:33 through 10:00 ET inclusive."""
+    if bar_time is None:
+        return False
+    minutes = bar_time.hour * 60 + bar_time.minute
+    start = GAP_ENTRY_START_HOUR * 60 + GAP_ENTRY_START_MINUTE
+    end = GAP_ENTRY_END_HOUR * 60 + GAP_ENTRY_END_MINUTE
+    return start <= minutes <= end
+
+
+def get_gap_signal_3m(df_3m: pd.DataFrame,
+                      bar_time=None,
+                      pmh: float = None,
+                      support: float = None,
+                      resistance: float = None) -> tuple[str, float, str]:
+    """
+    Opening-drive playbook checked before normal cloud/curl entries.
+
+    Gap & Go:
+      LONG when the current 3-min close crosses above max(PMH, resistance).
+      Initial stop is PMH.
+
+    Gap & Crap:
+      SHORT when the current 3-min close crosses below support.
+      Initial stop is support.
+    """
+    if not _in_gap_entry_window(bar_time) or len(df_3m) < 2:
+        return "none", 0.0, ""
+
+    cur = df_3m.iloc[-1]
+    prev = df_3m.iloc[-2]
+    entry_price = cur.close
+
+    if pmh is not None:
+        trigger = max(pmh, resistance) if resistance is not None else pmh
+        if prev.close <= trigger and entry_price > trigger and pmh < entry_price:
+            return "long", pmh, "gap_go_pmh"
+
+    if support is not None:
+        if prev.close >= support and entry_price < support:
+            return "short", support, "gap_crap_support"
+
+    return "none", 0.0, ""
 
 
 # ------------------------------------------------------------------ #

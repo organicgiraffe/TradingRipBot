@@ -15,12 +15,12 @@ sys.path.insert(0, ".")
 from config import (EMA_PERIODS, MIN_BARS_3M, MIN_BARS_10M,
                     MAX_TRADES_PER_DAY, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
                     MAX_RISK_PER_TRADE, MIN_SHARES, MIN_STOP_DIST,
-                    MAX_SIMULTANEOUS_POSITIONS, DTR_MAX_PCT,
+                    MAX_SIMULTANEOUS_POSITIONS, DTR_MAX_PCT, DTR_EXEMPT_ATR,
                     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
-                    MIN_DAILY_RANGE, BREAKEVEN_TRIGGER,
-                    FIRST_ENTRY_MINUTE, MAX_RISK_DOLLARS,
+                    MIN_DAILY_RANGE, BREAKEVEN_TRIGGER, PROFIT_TARGET_SHARE,
+                    FIRST_ENTRY_MINUTE, MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH,
                     LEVEL_PROX_LONG, LEVEL_PROX_SHORT)
-from ema_engine import (get_trend_10m, get_entry_signal_3m,
+from ema_engine import (get_trend_10m, get_entry_signal_3m, get_gap_signal_3m,
                         should_exit_10m, should_exit_rvol,
                         compute_trailing_stop, compute_dtr_atr_ratio)
 
@@ -146,7 +146,8 @@ def load_symbols_5m(symbols: list) -> dict:
 # ── Single-day simulation (multi-symbol, shared position slots) ────────────
 
 def sim_day(target: datetime.date, sym_data: dict,
-            daily_plan: dict = None, max_pos: int = None) -> list:
+            daily_plan: dict = None, max_pos: int = None,
+            enable_gap: bool = True) -> list:
     """Run one trading day across all loaded symbols with 2-slot limit.
 
     daily_plan (optional): dict keyed by symbol, each value a dict with:
@@ -165,6 +166,20 @@ def sim_day(target: datetime.date, sym_data: dict,
     # Active symbol set — always plan-restricted when we reach here
     active_syms = set(daily_plan.keys())
     active_syms = active_syms & set(sym_data.keys())   # must have data
+    avg_range_by = {}
+    for sym in active_syms:
+        df10_hist = sym_data[sym]["df_10m"]
+        recent_ranges = [
+            float(g["high"].max() - g["low"].min())
+            for d, g in df10_hist.groupby(df10_hist.index.date)
+            if d < target
+        ]
+        avg_range_by[sym] = (
+            sum(recent_ranges[-5:]) / min(len(recent_ranges[-5:]), 5)
+            if recent_ranges else 0.0
+        )
+    entry_order = sorted(active_syms, key=lambda s: avg_range_by.get(s, 0.0),
+                         reverse=True)
 
     all_times = sorted({
         t for sym in active_syms
@@ -209,6 +224,9 @@ def sim_day(target: datetime.date, sym_data: dict,
                 del positions[sym]
                 continue
 
+            unrealised = (cur["close"] - pos["entry"] if pos["dir"] == "long"
+                          else pos["entry"] - cur["close"])
+
             # ── Half exit at Rip's level ─────────────────────────────────
             # Exit 50 shares when price reaches the target level:
             #   Long  → Rip's resistance   Short → Rip's support
@@ -220,17 +238,25 @@ def sim_day(target: datetime.date, sym_data: dict,
                 p_sup    = pos.get("level_sup")
                 half_sh  = pos["shares"] // 2
                 half_px  = None
+                half_rsn = "half@level"
                 if pos["dir"] == "long"  and p_res is not None and cur["high"] >= p_res:
                     half_px = p_res
                 elif pos["dir"] == "short" and p_sup is not None and cur["low"]  <= p_sup:
                     half_px = p_sup
+                if pos["dir"] == "long":
+                    level_still_ahead = p_res is not None and p_res > pos["entry"]
+                else:
+                    level_still_ahead = p_sup is not None and p_sup < pos["entry"]
+                if half_px is None and not level_still_ahead and unrealised >= PROFIT_TARGET_SHARE:
+                    half_px = cur["close"]
+                    half_rsn = "half@target"
                 if half_px is not None and half_sh > 0:
                     half_pnl = ((half_px - pos["entry"]) * half_sh if pos["dir"] == "long"
                                 else (pos["entry"] - half_px) * half_sh)
                     if half_pnl > 0:           # only exit if genuinely profitable
                         trades.append({**pos, "shares": half_sh,
                                        "exit": half_px, "exit_time": bar_time,
-                                       "pnl": half_pnl, "reason": "half@level"})
+                                       "pnl": half_pnl, "reason": half_rsn})
                         _print_trade(trades[-1])
                         pos["shares"] -= half_sh
                     pos["half_exited"] = True  # don't check again even if pnl <= 0
@@ -298,10 +324,10 @@ def sim_day(target: datetime.date, sym_data: dict,
         # No entries before 09:45 — let the open price action settle.
         # First 15 min bars are chaotic (gap fills, algo stops, news reactions).
         too_early = (t.hour == 9 and t.minute < FIRST_ENTRY_MINUTE)
-        if too_early or no_new or len(positions) >= _max_pos:
+        if no_new or len(positions) >= _max_pos:
             continue
 
-        for sym in sorted(active_syms):   # sorted = deterministic slot assignment
+        for sym in entry_order:   # highest-ATR names get the first global slot
             if len(positions) >= _max_pos:
                 break
             if sym in positions:
@@ -331,20 +357,15 @@ def sim_day(target: datetime.date, sym_data: dict,
             # e.g. Rip's sheet: "DTR: 6.21 vs ATR: 7.59  82%" → skip entry
             dtr_ratio = compute_dtr_atr_ratio(df10_now, target,
                                               bar_time=bar_time)
-            if dtr_ratio > DTR_MAX_PCT:
+            dtr_exempt = avg_range_by.get(sym, 0.0) >= DTR_EXEMPT_ATR
+            if dtr_ratio > DTR_MAX_PCT and not dtr_exempt:
                 # Uncomment to debug: print(f"  DTR filter: {sym} {dtr_ratio:.0%} of ATR")
                 continue
 
             # Daily range filter — 5-day avg range must be ≥ $7 so a $5 move is realistic
-            recent_ranges = [
-                float(g["high"].max() - g["low"].min())
-                for d, g in df10_now.groupby(df10_now.index.date)
-                if d < target
-            ]
-            if recent_ranges:
-                avg_range = sum(recent_ranges[-5:]) / min(len(recent_ranges[-5:]), 5)
-                if avg_range < MIN_DAILY_RANGE:
-                    continue   # stock doesn't move enough to hit $5 target reliably
+            avg_range = avg_range_by.get(sym, 0.0)
+            if avg_range and avg_range < MIN_DAILY_RANGE:
+                continue   # stock doesn't move enough to hit $5 target reliably
 
             # Pull Rip's levels + bias for this symbol (if plan provided)
             plan  = (daily_plan or {}).get(sym, {})
@@ -352,9 +373,19 @@ def sim_day(target: datetime.date, sym_data: dict,
             sup   = plan.get("support")
             res   = plan.get("resistance")
 
-            signal, stop_price, _ = get_entry_signal_3m(
-                df3_now, trend, bar_time=bar_time, pmh=pmh, pml=pml,
-                support=sup, resistance=res)
+            if enable_gap:
+                signal, stop_price, entry_reason = get_gap_signal_3m(
+                    df3_now, bar_time=bar_time, pmh=pmh,
+                    support=sup, resistance=res)
+            else:
+                signal, stop_price, entry_reason = "none", None, ""
+            is_gap_entry = signal != "none"
+            if signal == "none":
+                if too_early:
+                    continue
+                signal, stop_price, entry_reason = get_entry_signal_3m(
+                    df3_now, trend, bar_time=bar_time, pmh=pmh, pml=pml,
+                    support=sup, resistance=res)
             if signal == "none" or signal == lost_dir_today.get(sym):
                 continue
 
@@ -368,11 +399,11 @@ def sim_day(target: datetime.date, sym_data: dict,
             # Long:  must be ≤ resistance + 1.5%  (at support, or fresh breakout)
             # Short: must be ≥ support   - 2.0%   (at resistance, or fresh breakdown)
             # When no level provided (symbol on plan but level unknown), skip check.
-            if signal == "long" and res is not None:
+            if not is_gap_entry and signal == "long" and res is not None:
                 if entry_price > res * (1 + LEVEL_PROX_LONG):
                     continue   # chasing — price already too far above resistance
 
-            if signal == "short" and sup is not None:
+            if not is_gap_entry and signal == "short" and sup is not None:
                 if entry_price < sup * (1 - LEVEL_PROX_SHORT):
                     continue   # chasing — price already too far below support
 
@@ -383,13 +414,15 @@ def sim_day(target: datetime.date, sym_data: dict,
 
             # Hard dollar risk cap — skip if stop is too wide in dollar terms.
             # Prevents disaster trades like Mar-31 MU ($7.16 stop × 100sh = $716).
-            if risk > MAX_RISK_DOLLARS:
+            risk_cap = MAX_RISK_DOLLARS_HIGH if entry_price >= HIGH_PRICE_THRESHOLD else MAX_RISK_DOLLARS
+            if risk > risk_cap:
                 continue
             slot = len(positions) + 1
             print(f"  >> {signal.upper():<5} {sym:6s} "
                   f"{bar_time.strftime('%H:%M')}  "
                   f"${entry_price:.2f}  stop=${stop_price:.2f}  "
-                  f"x{n}sh  risk=${risk:.0f}  [{slot}/{MAX_SIMULTANEOUS_POSITIONS}]")
+                  f"x{n}sh  risk=${risk:.0f}  [{entry_reason}]  "
+                  f"[{slot}/{MAX_SIMULTANEOUS_POSITIONS}]")
             positions[sym] = {
                 "symbol": sym, "dir": signal,
                 "entry": entry_price, "stop": stop_price,
@@ -556,6 +589,19 @@ if __name__ == "__main__":
             "META":  {"support": 607.00, "resistance": 608.70},
             "NFLX":  {"support":  89.59, "resistance":  90.00},
         },
+        # May 26 — from Rip's News Play + Day2 Day3 screenshots
+        datetime.date(2026, 5, 26): {
+            "NVDA":  {"support": 217.00, "resistance": 219.00},
+            "TSLA":  {"support": 428.50, "resistance": 431.50},
+            "MSFT":  {"support": 310.00, "resistance": 311.40},
+            "GOOGL": {"support": 383.00, "resistance": 385.00},
+            "AAPL":  {"support": 310.00, "resistance": 311.50},
+            "AMD":   {"support": 481.40, "resistance": 484.20},
+            "AMZN":  {"support": 266.50, "resistance": 268.00},
+            "META":  {"support": 608.00, "resistance": 611.00},
+            "NFLX":  {"support":  88.00, "resistance":  88.30},
+            "MU":    {"support": 805.00, "resistance": 818.68},
+        },
     }
     # ──────────────────────────────────────────────────────────────────────
 
@@ -690,7 +736,8 @@ if __name__ == "__main__":
     for target in ro_dates:
         plan = {s: {"support": None, "resistance": None}
                 for s in WATCHLIST if s in sym_data_5m}
-        day_trades = sim_day(target, sym_data_5m, daily_plan=plan)
+        day_trades = sim_day(target, sym_data_5m, daily_plan=plan,
+                             enable_gap=False)
         ro_all_trades.extend(day_trades)
         day_pnl  = sum(t["pnl"] for t in day_trades)
         day_wins = sum(1 for t in day_trades if t["pnl"] > 0)
@@ -730,15 +777,16 @@ if __name__ == "__main__":
     print(f"{'#'*60}")
 
     # ── Slots comparison: 1 vs 2 simultaneous positions ───────────────────
-    # Re-run plan days AND rules-only with max_pos=2 to see if a second slot adds value.
+    # Re-run plan days and rules-only to compare the opening-drive model.
     # Data is already in memory — no extra download needed.
     print(f"\n\n{'='*60}")
-    print(f"  SLOTS COMPARISON  (1 vs 2 simultaneous positions)")
+    print(f"  GAP MODEL COMPARISON")
     print(f"{'='*60}")
 
     import io, contextlib
 
-    def _run_scenario(mp, sym_data_1m, sym_data_5m_local, plan_dates, ro_dates_local):
+    def _run_scenario(mp, sym_data_1m, sym_data_5m_local, plan_dates,
+                      ro_dates_local, enable_gap=True, label=None):
         # Suppress per-trade print lines — we only want the summary numbers
         sink = io.StringIO()
         with contextlib.redirect_stdout(sink):
@@ -746,12 +794,14 @@ if __name__ == "__main__":
             for d in sorted(plan_dates):
                 sd   = sym_data_5m_local if d < min(last5) else sym_data_1m
                 plan = PLANS[d]
-                p_trades.extend(sim_day(d, sd, daily_plan=plan, max_pos=mp))
+                p_trades.extend(sim_day(d, sd, daily_plan=plan, max_pos=mp,
+                                        enable_gap=enable_gap))
             r_trades = []
             for d in ro_dates_local:
                 plan = {s: {"support": None, "resistance": None}
                         for s in WATCHLIST if s in sym_data_5m_local}
-                r_trades.extend(sim_day(d, sym_data_5m_local, daily_plan=plan, max_pos=mp))
+                r_trades.extend(sim_day(d, sym_data_5m_local, daily_plan=plan,
+                                        max_pos=mp, enable_gap=False))
 
         p_pnl = sum(t["pnl"] for t in p_trades)
         p_w   = sum(1 for t in p_trades if t["pnl"] > 0)
@@ -760,7 +810,8 @@ if __name__ == "__main__":
         r_w   = sum(1 for t in r_trades if t["pnl"] > 0)
         r_tot = len(r_trades)
 
-        print(f"\n  max_pos={mp}")
+        title = label or f"max_pos={mp}"
+        print(f"\n  {title}")
         if p_tot:
             print(f"  Plan days   {p_tot:3d} trades  {p_w}W/{p_tot-p_w}L  "
                   f"win%={p_w/p_tot*100:.0f}%  total=${p_pnl:+.0f}  "
@@ -776,7 +827,11 @@ if __name__ == "__main__":
         return p_pnl, r_pnl
 
     all_plan_dates = sorted(PLANS.keys())
-    for mp in [1, 2]:
-        _run_scenario(mp, sym_data, sym_data_5m, all_plan_dates, ro_dates)
+    _run_scenario(1, sym_data, sym_data_5m, all_plan_dates, ro_dates,
+                  enable_gap=False, label="cloud-only, max_pos=1")
+    _run_scenario(1, sym_data, sym_data_5m, all_plan_dates, ro_dates,
+                  enable_gap=True, label="gap-enabled, max_pos=1")
+    _run_scenario(2, sym_data, sym_data_5m, all_plan_dates, ro_dates,
+                  enable_gap=True, label="gap-enabled, max_pos=2")
 
     print(f"\n{'='*60}")

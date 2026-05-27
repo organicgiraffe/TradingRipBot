@@ -13,10 +13,12 @@ import warnings; warnings.filterwarnings("ignore")
 import sys, yfinance as yf, pandas as pd
 
 sys.path.insert(0, r"C:\Users\nicol\OneDrive\Documents\Tradingbot")
-from ema_engine import compute_emas, get_trend_10m, get_entry_signal_3m
+from ema_engine import (compute_emas, get_trend_10m,
+                        get_entry_signal_3m, get_gap_signal_3m)
 from config import (
     MIN_BARS_3M, RATCHET_START, RATCHET_GIVEBACK, PROFIT_TARGET_SHARE,
     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
+    MAX_TRADES_PER_DAY,
     MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH, MIN_DAILY_RANGE,
     DTR_MAX_PCT, DTR_EXEMPT_ATR, FIRST_ENTRY_MINUTE,
     LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE,
@@ -25,17 +27,17 @@ from config import (
 )
 
 PLAN = {
-    "TSLA":  {"support": 428.63, "resistance": 429.80},
-    "NVDA":  {"support": 217.41, "resistance": 218.52},
-    "AMD":   {"support": 475.80, "resistance": 480.00},
-    "META":  {"support": 610.00, "resistance": 612.00},
-    "GOOGL": {"support": 384.30, "resistance": 385.20},
-    "MU":    {"support": 800.00, "resistance": None},
-    "ARM":   {"support": 309.75, "resistance": 314.50},
+    "TSLA":  {"support": 428.50, "resistance": 431.50},
+    "NVDA":  {"support": 217.00, "resistance": 219.00},
+    "AMD":   {"support": 481.40, "resistance": 484.20},
+    "META":  {"support": 608.00, "resistance": 611.00},
+    "GOOGL": {"support": 383.00, "resistance": 385.00},
+    "MU":    {"support": 805.00, "resistance": 818.68},
     "IONQ":  {"support":  63.80, "resistance":  65.00},
     "OKLO":  {"support":  71.00, "resistance":  73.00},
 }
 TODAY = pd.Timestamp("2026-05-26").date()
+ENABLE_GAP_ENTRIES = "--cloud-only" not in sys.argv and "--no-gap" not in sys.argv
 
 
 class Bar:
@@ -45,8 +47,9 @@ class Bar:
 
 
 def download_and_resample(sym):
-    df = yf.download(sym, period="5d", interval="1m", auto_adjust=True, progress=False)
-    if df.empty: return None, None
+    df = yf.download(sym, period="5d", interval="1m",
+                     auto_adjust=True, progress=False, prepost=True)
+    if df.empty: return None, None, None, None
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0].lower() for c in df.columns]
     else:
@@ -54,6 +57,9 @@ def download_and_resample(sym):
     df.index = pd.to_datetime(df.index)
     df.index = (df.index.tz_convert("America/New_York")
                 if df.index.tz else df.index.tz_localize("America/New_York"))
+    today_pre = df[df.index.date == TODAY].between_time("04:00", "09:29")
+    pmh = float(today_pre["high"].max()) if not today_pre.empty else None
+    pml = float(today_pre["low"].min()) if not today_pre.empty else None
     df = df.between_time("09:30", "15:59")
     def rsmp(m):
         r = df.resample(f"{m}min", closed="left", label="left").agg(
@@ -62,7 +68,7 @@ def download_and_resample(sym):
         ).dropna(subset=["close"])
         r.index += pd.Timedelta(minutes=m)
         return r
-    return rsmp(3), rsmp(10)
+    return rsmp(3), rsmp(10), pmh, pml
 
 
 def to_bars(df):
@@ -83,17 +89,19 @@ def trail_stop(sig, stop, entry, best, ema50):
 
 # ── Download all data upfront ─────────────────────────────────────────────────
 print(f"\n{'='*78}")
-print(f"  BACKTEST  --  {TODAY}  --  1 global trade at a time  (real bot behaviour)")
+mode = "gap-enabled" if ENABLE_GAP_ENTRIES else "cloud-only"
+print(f"  BACKTEST  --  {TODAY}  --  1 global trade at a time  ({mode})")
 print(f"{'='*78}\n")
 print("  Downloading data...", end="", flush=True)
 
 sym_data   = {}   # sym -> (bars3_all, bars10_all, today3, shares)
 lost_dir   = {}   # sym -> direction blocked today after >$50 loss
+trades_today = {}
 sym_atr    = {}   # sym -> 5-day avg daily range ($) — used for priority scoring
 
 skipped_atr = {}
 for sym, lev in PLAN.items():
-    df3, df10 = download_and_resample(sym)
+    df3, df10, pmh, pml = download_and_resample(sym)
     if df3 is None: continue
     b10 = to_bars(df10); b3 = to_bars(df3)
     t3  = [b for b in b3 if pd.Timestamp(b.date).date() == TODAY]
@@ -112,8 +120,9 @@ for sym, lev in PLAN.items():
     if atr < MIN_DAILY_RANGE:
         skipped_atr[sym] = atr
         continue   # too low ATR — not worth trading
-    sym_data[sym] = (b3, b10, t3, sh)
+    sym_data[sym] = (b3, b10, t3, sh, pmh, pml)
     lost_dir[sym] = None
+    trades_today[sym] = 0
 
 print(f" done ({len(sym_data)} active, {len(skipped_atr)} skipped)\n")
 print(f"  ATR (5-day avg daily range)  — min=${MIN_DAILY_RANGE:.0f}:")
@@ -139,7 +148,7 @@ for bt in all_times:
         sym   = t["sym"]
         sig   = t["sig"]
         entry = t["entry"]
-        b3, b10, today3, shares = sym_data[sym]
+        b3, b10, today3, shares, pmh, pml = sym_data[sym]
 
         # Find the bar for this symbol at this time
         fb = next((b for b in today3 if pd.Timestamp(b.date) == bt), None)
@@ -152,9 +161,6 @@ for bt in all_times:
         cur  = df3f.iloc[-1]
 
         unr = (cur.close - entry) if sig=="long" else (entry - cur.close)
-        t["best_unr"] = max(t["best_unr"], unr)
-        t["peak_unr"] = max(t["peak_unr"], unr)
-
         t["stop_cur"] = trail_stop(sig, t["stop_cur"], entry, t["best_unr"], cur.ema50)
 
         exit_px  = None
@@ -181,6 +187,9 @@ for bt in all_times:
                     t["half_pnl"]  = hp
                     t["remaining"] = shares - shares//2
                 t["half_done"] = True
+
+        t["best_unr"] = max(t["best_unr"], unr)
+        t["peak_unr"] = max(t["peak_unr"], unr)
 
         # Hard stop
         if exit_px is None:
@@ -210,6 +219,7 @@ for bt in all_times:
                 "exit_px": exit_px, "exit_t": fbt, "exit_why": exit_why,
                 "held": held_m, "peak": t["peak_unr"],
             })
+            trades_today[sym] += 1
             if total < -50:
                 lost_dir[sym] = sig
             in_trade   = False
@@ -220,14 +230,14 @@ for bt in all_times:
     if (bt.hour > LAST_ENTRY_HOUR or
             (bt.hour == LAST_ENTRY_HOUR and bt.minute >= LAST_ENTRY_MINUTE)):
         continue
-    if bt.hour == 9 and bt.minute < FIRST_ENTRY_MINUTE:
-        continue
 
     # Collect ALL valid signals this bar, then pick highest ATR
     candidates = []
     for sym in sym_data:
-        b3, b10, today3, shares = sym_data[sym]
+        b3, b10, today3, shares, pmh, pml = sym_data[sym]
         sup = PLAN[sym]["support"]; res = PLAN[sym]["resistance"]
+        if trades_today.get(sym, 0) >= MAX_TRADES_PER_DAY:
+            continue
 
         bar = next((b for b in today3 if pd.Timestamp(b.date)==bt), None)
         if bar is None: continue
@@ -240,8 +250,19 @@ for bt in all_times:
         df3e  = compute_emas(b3s)
         trend = get_trend_10m(df10e)
 
-        sig, stop_px, reason = get_entry_signal_3m(
-            df3e, trend, bar_time=bt.to_pydatetime(), support=sup, resistance=res)
+        if ENABLE_GAP_ENTRIES:
+            sig, stop_px, reason = get_gap_signal_3m(
+                df3e, bar_time=bt.to_pydatetime(), pmh=pmh,
+                support=sup, resistance=res)
+        else:
+            sig, stop_px, reason = "none", None, ""
+        is_gap_entry = sig != "none"
+        if sig == "none":
+            if bt.hour == 9 and bt.minute < FIRST_ENTRY_MINUTE:
+                continue
+            sig, stop_px, reason = get_entry_signal_3m(
+                df3e, trend, bar_time=bt.to_pydatetime(),
+                support=sup, resistance=res)
         if sig == "none": continue
         if sig == lost_dir[sym]: continue
 
@@ -250,8 +271,8 @@ for bt in all_times:
         risk      = stop_dist * shares
         risk_cap  = MAX_RISK_DOLLARS_HIGH if entry >= HIGH_PRICE_THRESHOLD else MAX_RISK_DOLLARS
         if risk > risk_cap: continue
-        if sig=="long"  and res and entry > res*(1+LEVEL_PROX_LONG):  continue
-        if sig=="short" and sup and entry < sup*(1-LEVEL_PROX_SHORT): continue
+        if not is_gap_entry and sig=="long"  and res and entry > res*(1+LEVEL_PROX_LONG):  continue
+        if not is_gap_entry and sig=="short" and sup and entry < sup*(1-LEVEL_PROX_SHORT): continue
 
         candidates.append({
             "sym": sym, "sig": sig, "entry": entry, "entry_t": bt,
@@ -272,7 +293,7 @@ for bt in all_times:
 if in_trade and open_trade:
     t    = open_trade
     sym  = t["sym"]
-    b3, b10, today3, shares = sym_data[sym]
+    b3, b10, today3, shares, pmh, pml = sym_data[sym]
     last = today3[-1]
     exit_px = last.close; fbt = pd.Timestamp(last.date)
     runner  = ((exit_px-t["entry"])*t["remaining"]) if t["sig"]=="long" else ((t["entry"]-exit_px)*t["remaining"])
@@ -296,13 +317,14 @@ print(HDR)
 print(f"  {'-'*112}")
 
 for n, r in enumerate(all_trades, 1):
-    sign = "+" if r["total_pnl"]>=0 else ""
+    sign = "+" if r["total_pnl"]>=0 else "-"
     pk   = f"+${r['peak']:.2f}" if r["peak"]>=0 else f"-${abs(r['peak']):.2f}"
     tag  = "WIN" if r["total_pnl"]>0 else ("SCR" if abs(r["total_pnl"])<20 else "LOS")
     extra = ""
     if r["half_pnl"]:
-        rs = "+" if r["runner_pnl"]>=0 else ""
-        extra = f"  (half +${r['half_pnl']:.0f}  runner {rs}${r['runner_pnl']:.0f})"
+        rs = "+" if r["runner_pnl"]>=0 else "-"
+        extra = (f"  (half +${r['half_pnl']:.0f}  "
+                 f"runner {rs}${abs(r['runner_pnl']):.0f})")
     print(
         f"  {n:<2}  {r['time'].strftime('%H:%M')}  {r['sym']:<5}  {r['sig']:<5}  "
         f"${r['entry']:>6.2f}  ${r['stop']:>6.2f}  ${r['risk']:>4.0f}  "

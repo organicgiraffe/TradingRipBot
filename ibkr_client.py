@@ -27,13 +27,15 @@ from config import (TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
                     MAX_SIMULTANEOUS_POSITIONS,
                     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
                     MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH, MIN_DAILY_RANGE,
+                    MAX_TRADES_PER_DAY,
                     LEVEL_PROX_LONG, LEVEL_PROX_SHORT,
                     DTR_MAX_PCT, DTR_EXEMPT_ATR, FIRST_ENTRY_MINUTE, MARKET_OPEN_HOUR,
                     MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
                     VOLUME_CONFIRM_MULT, DEBUG_SIGNALS,
                     PROFIT_TARGET_SHARE)
 from ema_engine import (compute_emas, get_trend_10m,
-                        get_entry_signal_3m, should_exit_10m,
+                        get_entry_signal_3m, get_gap_signal_3m,
+                        should_exit_10m,
                         should_exit_rvol, compute_trailing_stop,
                         compute_dtr_atr_ratio)
 from position import Position
@@ -408,10 +410,25 @@ class TradingBot:
         # ─────────────────────────────────────────────────────────────────
         if len(self.positions) >= MAX_SIMULTANEOUS_POSITIONS:
             return
-
-        # Time gate — match backtest: no entries before FIRST_ENTRY_MINUTE
-        if now.hour == MARKET_OPEN_HOUR and now.minute < FIRST_ENTRY_MINUTE:
+        if self._trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return
+
+        # Rip's levels for this symbol (None = rules-only, no filter applied)
+        plan_entry = self.plan.get(symbol, {})
+        sup = plan_entry.get("support")
+        res = plan_entry.get("resistance")
+
+        trend = self.trend.get(symbol, "none")
+
+        gap_signal, gap_stop, gap_reason = get_gap_signal_3m(
+            df_3m, bar_time=now, pmh=self.pmh.get(symbol),
+            support=sup, resistance=res)
+
+        # Time gate — normal cloud/curl entries wait until FIRST_ENTRY_MINUTE,
+        # but opening-drive gap entries may fire from 09:33 through 10:00.
+        if gap_signal == "none":
+            if now.hour == MARKET_OPEN_HOUR and now.minute < FIRST_ENTRY_MINUTE:
+                return
 
         # DTR/ATR exhaustion gate — skip when daily range is >= 75% of ATR
         # Exempt high-ATR momentum stocks (≥ DTR_EXEMPT_ATR): they regularly exceed
@@ -423,13 +440,6 @@ class TradingBot:
             if DEBUG_SIGNALS:
                 print(f"  {now.strftime('%H:%M')}  {symbol:6s}  SKIP: DTR {dtr_ratio:.0%} of ATR  (ATR=${sym_atr_5d:.0f})")
             return
-
-        # Rip's levels for this symbol (None = rules-only, no filter applied)
-        plan_entry = self.plan.get(symbol, {})
-        sup = plan_entry.get("support")
-        res = plan_entry.get("resistance")
-
-        trend = self.trend.get(symbol, "none")
 
         # ── Debug: cloud state + key values every bar ────────────────────
         if DEBUG_SIGNALS:
@@ -451,10 +461,13 @@ class TradingBot:
                 f"  px={_c.close:.2f}"
             )
 
-        signal, stop_price, entry_reason = get_entry_signal_3m(
-            df_3m, trend, bar_time=now,
-            pmh=self.pmh.get(symbol), pml=self.pml.get(symbol),
-            support=sup, resistance=res)
+        if gap_signal != "none":
+            signal, stop_price, entry_reason = gap_signal, gap_stop, gap_reason
+        else:
+            signal, stop_price, entry_reason = get_entry_signal_3m(
+                df_3m, trend, bar_time=now,
+                pmh=self.pmh.get(symbol), pml=self.pml.get(symbol),
+                support=sup, resistance=res)
 
         if signal == "none":
             # ── Explain what blocked a flip (only interesting bars) ───────
@@ -511,14 +524,15 @@ class TradingBot:
             return
 
         # Level proximity gate — only enter AT Rip's level, not mid-range
-        if signal == "long" and res is not None:
+        is_gap_entry = entry_reason.startswith("gap_")
+        if not is_gap_entry and signal == "long" and res is not None:
             if entry_price > res * (1 + LEVEL_PROX_LONG):
                 tlog.info(
                     f"SKIP  {symbol}  LONG   ${entry_price:.2f}  "
                     f"chasing +{(entry_price/res - 1)*100:.1f}% above res ${res:.2f}"
                 )
                 return
-        if signal == "short" and sup is not None:
+        if not is_gap_entry and signal == "short" and sup is not None:
             if entry_price < sup * (1 - LEVEL_PROX_SHORT):
                 tlog.info(
                     f"SKIP  {symbol}  SHORT  ${entry_price:.2f}  "
@@ -715,6 +729,7 @@ class TradingBot:
     def run(self):
         self.connect()
         self.subscribe_bars()
+        self.setup_premarket_levels()
 
         tlog.info("BOT LIVE  symbols=" + ", ".join(self.symbols))
         tlog.info(f"  entry gate: 09:{FIRST_ENTRY_MINUTE:02d} ET | "

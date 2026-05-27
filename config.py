@@ -58,6 +58,10 @@ GAP_THRESHOLD        = 0.020  # ema50 > 2.0% from price = Day1 gap-up/down catal
                               # above this: use ema12 as tighter stop, allow TYPE 1b entry
 FIRST_ENTRY_MINUTE   = 40     # no entries before 09:40 — skip the first 5-min chaos
                                # 9:40-9:44 setups are valid; $700 risk cap handles disasters
+GAP_ENTRY_START_HOUR   = 9     # Gap & Go / Gap & Crap opening-drive window
+GAP_ENTRY_START_MINUTE = 33    # first completed 3-min bar
+GAP_ENTRY_END_HOUR     = 10
+GAP_ENTRY_END_MINUTE   = 0     # inclusive: allow the 10:00 bar close
 LAST_ENTRY_HOUR      = 15     # no new entries at or after this hour (ET)
 LAST_ENTRY_MINUTE    = 0      # → 15:00  gives at least 50 min for trade to develop
 FRIDAY_OPEN_MINUTE   = 45     # Lotto Friday: hold extra 5 min — first entry 09:45
