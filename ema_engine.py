@@ -173,7 +173,16 @@ def compute_trailing_stop(df_3m: pd.DataFrame, direction: str,
         if best_unrealised >= RATCHET_START:
             floor = entry_price + max(0.0, best_unrealised - RATCHET_GIVEBACK)
             trail_to = max(trail_to, floor)
-        return max(current_stop, trail_to)          # never move stop down
+        new_stop = max(current_stop, trail_to)      # never move stop down
+        # Symmetric guard with the short path below:
+        # On cloud_cont_crash longs (rip-and-go entries), ema5 << ema50,
+        # so trail_to = ema50 sits ABOVE the initial stop.  Without the
+        # guard the next 1-min bar tightens the stop to ema50 and any
+        # normal wick stops the trade out.  Keep the initial stop intact
+        # until the ratchet has been triggered.
+        if best_unrealised < RATCHET_START and new_stop > current_stop:
+            return current_stop
+        return new_stop
 
     else:  # short
         if best_unrealised >= RATCHET_START:

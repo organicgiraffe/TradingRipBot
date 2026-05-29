@@ -1,0 +1,12 @@
+{
+  "_comment": "Today's trading plan from Rip's News Play sheet. Edit symbols and levels each morning, then just run: python main.py",
+  "date": "2026-05-29",
+  "symbols": [
+    { "symbol": "SNDK", "support": 1662.5, "resistance": 1670.0 },
+    { "symbol": "MU",   "support": 940.0,  "resistance": 945.0 },
+    { "symbol": "LLY",  "support": 1115.0, "resistance": 1130.0 },
+    { "symbol": "AMD",  "support": 518.0,  "resistance": 522.0 },
+    { "symbol": "CRM",  "support": 180.0,  "resistance": 180.85 },
+    { "symbol": "PLTR", "support": 146.5,  "resistance": 148.4 }
+  ]
+}

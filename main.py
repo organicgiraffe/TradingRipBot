@@ -14,8 +14,10 @@ Pre-requisites:
     3. Python packages: ib_insync, pandas, yfinance
 """
 import collections
+import json
 import logging
 import os
+import pathlib
 import signal
 import sys
 from datetime import date
@@ -76,13 +78,129 @@ def _compute_atr(sym: str) -> float | None:
     return None
 
 
+def _process_symbols_with_plan(all_syms: list[str], plan_levels: dict) -> tuple[list[str], dict]:
+    """Run ATR filter on JSON-supplied symbols, return (passed_symbols, plan).
+    Skips the interactive level-prompt — levels come from plan_levels.
+    Still prints the same summary and asks for the start confirmation."""
+    print(f"\n  Checking 5-day ATR (min=${MIN_DAILY_RANGE:.2f}) ...\n")
+    passed, dropped = [], []
+    atr_map: dict[str, float] = {}
+    for sym in all_syms:
+        atr = _compute_atr(sym)
+        atr_map[sym] = atr or 0.0
+        if atr is None:
+            print(f"    {sym:<6}  (no data — skipped)")
+            dropped.append(sym)
+        elif atr < MIN_DAILY_RANGE:
+            print(f"    {sym:<6}  ATR=${atr:.2f}  SKIP  (< ${MIN_DAILY_RANGE:.2f})")
+            dropped.append(sym)
+        else:
+            print(f"    {sym:<6}  ATR=${atr:.2f}  OK")
+            passed.append(sym)
+
+    if not passed:
+        print("\n  No symbols passed the ATR filter. Exiting.")
+        sys.exit(1)
+
+    passed.sort(key=lambda s: atr_map[s], reverse=True)
+
+    if dropped:
+        print(f"\n  Dropped {len(dropped)}: {', '.join(dropped)}")
+    print(f"  Active  {len(passed)}: {', '.join(passed)}  (sorted by ATR, highest first)\n")
+
+    # Use levels from JSON plan; missing entries default to rules-only
+    plan: dict = {}
+    for sym in passed:
+        levels = plan_levels.get(sym, {})
+        plan[sym] = {
+            "support":    levels.get("support"),
+            "resistance": levels.get("resistance"),
+        }
+
+    # Summary
+    print("-" * 62)
+    print("  TODAY'S PLAN")
+    print("-" * 62)
+    for sym in passed:
+        p     = plan[sym]
+        atr   = atr_map[sym]
+        sup_s = f"${p['support']:.2f}"    if p["support"]    else "—"
+        res_s = f"${p['resistance']:.2f}" if p["resistance"] else "—"
+        risk_cap = MAX_RISK_DOLLARS_HIGH if atr >= HIGH_PRICE_THRESHOLD else MAX_RISK_DOLLARS
+        print(f"  {sym:6s}  ATR=${atr:.2f}  sup={sup_s:<10} res={res_s:<10} risk_cap=${risk_cap}")
+    print()
+    print(f"  Shares   : {FIXED_SHARES} (< ${HIGH_PRICE_THRESHOLD:.0f})  "
+          f"/ {FIXED_SHARES_HIGH} (>= ${HIGH_PRICE_THRESHOLD:.0f})")
+    print(f"  Entry    : no trades before 09:{FIRST_ENTRY_MINUTE:02d} ET")
+    print(f"  Slots    : {MAX_SIMULTANEOUS_POSITIONS} simultaneous position(s)")
+    print(f"  Log file : logs/trades_{today_str}.log")
+    print("-" * 62)
+
+    confirm = input("\nStart bot? (y/n): ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        sys.exit(0)
+    return passed, plan
+
+
+def _load_daily_plan_json() -> tuple[list[str], dict] | None:
+    """Load symbols + levels from daily_plan.json if it exists.
+    Returns (symbols, plan) on success, None if file missing/invalid.
+    Plan format:
+      {
+        "symbols": [
+          {"symbol": "SNDK", "support": 1662.5, "resistance": 1670.0},
+          ...
+        ]
+      }
+    """
+    plan_path = pathlib.Path("daily_plan.json")
+    if not plan_path.exists():
+        return None
+    try:
+        data = json.loads(plan_path.read_text())
+        items = data.get("symbols", [])
+        if not items:
+            print("  daily_plan.json has no symbols — falling back to interactive.")
+            return None
+        all_syms = []
+        plan_levels: dict = {}
+        for item in items:
+            sym = item.get("symbol", "").strip().upper()
+            if not sym:
+                continue
+            all_syms.append(sym)
+            plan_levels[sym] = {
+                "support":    float(item["support"])    if item.get("support")    is not None else None,
+                "resistance": float(item["resistance"]) if item.get("resistance") is not None else None,
+            }
+        if not all_syms:
+            return None
+        plan_date = data.get("date", "?")
+        print(f"\n  Loaded daily_plan.json  (plan date: {plan_date})  →  {len(all_syms)} symbols")
+        return all_syms, plan_levels
+    except Exception as e:
+        print(f"  ERROR reading daily_plan.json — {e}")
+        print(f"  Falling back to interactive input.")
+        return None
+
+
 def get_startup_inputs() -> tuple[list[str], dict]:
-    """Gather today's symbols, auto-filter by ATR, then ask for Rip's levels."""
+    """Gather today's symbols, auto-filter by ATR, then apply Rip's levels.
+    Tries daily_plan.json FIRST; falls back to interactive prompt if missing."""
     print()
     print("=" * 62)
     print("   RIPSTER CLOUD TRADING BOT  —  Paper Trading")
     print("=" * 62)
 
+    # Try JSON file first
+    json_result = _load_daily_plan_json()
+    if json_result is not None:
+        all_syms, json_plan = json_result
+        # Run ATR filter on JSON symbols, then merge with JSON levels
+        return _process_symbols_with_plan(all_syms, json_plan)
+
+    # ── Interactive fallback ──────────────────────────────────────────
     raw = input("\nSymbols (comma-separated, e.g. TSLA, NVDA, AMD, MU): ")
     all_syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
     if not all_syms:

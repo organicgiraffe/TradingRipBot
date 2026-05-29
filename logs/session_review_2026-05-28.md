@@ -145,4 +145,25 @@ Orders                     = MKT only (paper + live)
 3. Multi-symbol live bot improvements (slot priority, tiering)
 4. Wire Rip bias + levels into live bot morning startup
 5. Separate Day1 news plays from Day2/Day3 continuation plays
-6. Fix "ENTRY" being logged before fill confirmation
+
+## Codex code-review findings (addressed end of session)
+
+| # | Finding | Status | Fix |
+|---|---|---|---|
+| 1 | Live/backtest range filter mismatch (live only checked absolute MIN_DAILY_RANGE, backtest also checked MIN_DAILY_RANGE_PCT) | **FIXED** | `subscribe_bars` now applies both filters; matches backtest |
+| 2 | DTR_EXEMPT_ATR mismatch — actual config = $5, not $10; live DTR check only used ATR not vol_pct | **FIXED** | Live `_on_new_bar_3m` DTR check now matches backtest exactly: `(sym_atr_5d >= DTR_EXEMPT_ATR) or (vol_pct >= 0.030)` |
+| 3 | ENTRY logged before fill — cancelled orders (Error 354) looked like real entries | **FIXED** | ENTRY now written inside `_on_fill` callback only, using actual fill price. Cancelled orders write `CANCELLED` to trades log |
+| 4 | Crash stop race condition — cancelOrder is async, STP could fire between cancel + exit MKT | **FIXED** | `_close_position` now polls cancellation status for up to 2s before placing exit |
+| 5 | Strategy fragility — 5-day sample is in-sample, Friday −$936 is warning | **Acknowledged** — not a code fix; needs multi-week validation |
+
+### Live/backtest parity table (post-fix)
+| Filter | Live | Backtest |
+|---|---|---|
+| Range floor (abs $) | ✓ MIN_DAILY_RANGE | ✓ MIN_DAILY_RANGE |
+| Range floor (%) | ✓ MIN_DAILY_RANGE_PCT | ✓ MIN_DAILY_RANGE_PCT |
+| DTR exemption | ✓ ATR≥$5 OR vol_pct≥3% | ✓ ATR≥$5 OR vol_pct≥3% |
+| 5/12 flip filter | ✓ none (no C3/trend/vol) | ✓ none |
+| Stop floor (abs $) | ✓ MIN_STOP_DIST | ✓ MIN_STOP_DIST |
+| Stop range (%) | ✓ MIN_STOP_PCT_LOWER / MAX_STOP_PCT | ✓ MIN_STOP_PCT_LOWER / MAX_STOP_PCT |
+| Crash-stop race | ✓ Synchronous wait | n/a (no real orders) |
+| ENTRY logging | ✓ After fill only | n/a (instant fills in sim) |
