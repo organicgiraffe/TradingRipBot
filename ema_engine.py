@@ -3,10 +3,12 @@ from config import (EMA_PERIODS, MIN_BARS_10M, MIN_BARS_3M,
                     MAX_STOP_DISTANCE, MAX_STOP_PCT, MIN_STOP_PCT_LOWER,
                     BREAKEVEN_TRIGGER, RATCHET_START, RATCHET_GIVEBACK,
                     VOLUME_CONFIRM_MULT,
-                    CLOUD_EXIT_BUFFER, GAP_THRESHOLD,
+                    CLOUD_EXIT_BUFFER, GAP_THRESHOLD, CLOUD_CONT_MAX_DIST,
                     MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE,
                     GAP_ENTRY_START_HOUR, GAP_ENTRY_START_MINUTE,
                     GAP_ENTRY_END_HOUR, GAP_ENTRY_END_MINUTE,
+                    OPEN_CLOUD_BREAK_BODY_PCT, OPEN_CLOUD_BREAK_RANGE_PCT,
+                    OPEN_CLOUD_BREAK_VOL_MULT,
                     LAST_ENTRY_HOUR, LAST_ENTRY_MINUTE,
                     FRIDAY_OPEN_MINUTE,
                     RVOL_EXIT_MULT,
@@ -112,7 +114,9 @@ def _stop_ok(entry_price: float, stop_price: float, direction: str) -> bool:
     """
     Accept the trade only if the stop is within MAX_STOP_PCT of entry price.
     2.5% of a $400 stock = $10 max stop — scales correctly for any price.
-    Also enforces a hard MAX_STOP_DISTANCE dollar floor as a secondary cap.
+    No dollar cap — actual risk is gated downstream by MAX_RISK_DOLLARS /
+    MAX_RISK_DOLLARS_HIGH per-trade caps.  A $15 dollar cap here was silently
+    blocking every MU/META/SNDK trade because their 2.5% range exceeds $15.
     """
     dist = (entry_price - stop_price if direction == "long"
             else stop_price - entry_price)
@@ -120,8 +124,7 @@ def _stop_ok(entry_price: float, stop_price: float, direction: str) -> bool:
         return False
     pct = dist / entry_price
     return (pct >= MIN_STOP_PCT_LOWER and      # floor: tighter than 0.25% = noise
-            pct <= MAX_STOP_PCT and            # ceiling: wider than 2.5% = too much risk
-            dist <= MAX_STOP_DISTANCE * 3)     # hard dollar cap
+            pct <= MAX_STOP_PCT)               # ceiling: wider than 2.5% = too much risk
 
 
 # ------------------------------------------------------------------ #
@@ -176,7 +179,14 @@ def compute_trailing_stop(df_3m: pd.DataFrame, direction: str,
         if best_unrealised >= RATCHET_START:
             floor = entry_price - max(0.0, best_unrealised - RATCHET_GIVEBACK)
             trail_to = min(trail_to, floor)
-        return min(current_stop, trail_to)          # never move stop up
+        new_stop = min(current_stop, trail_to)
+        # Guard: crash entries (cloud_cont_crash) have ema50 well below entry_price.
+        # Without this guard, trail_to = ema50 << entry immediately drops the stop
+        # into "profit territory" and triggers the short stop on the very next bar.
+        # Keep the existing stop unchanged until the ratchet has activated.
+        if best_unrealised < RATCHET_START and new_stop < entry_price:
+            return current_stop
+        return new_stop
 
 
 # ------------------------------------------------------------------ #
@@ -257,6 +267,61 @@ def get_gap_signal_3m(df_3m: pd.DataFrame,
     return "none", 0.0, ""
 
 
+def get_open_cloud_break_signal_3m(df_3m: pd.DataFrame,
+                                   bar_time=None) -> tuple[str, float, str]:
+    """
+    Opening-drive cloud break playbook.
+
+    This is separate from Rip support/resistance. It catches stocks that gap in
+    premarket and then slice through the active 5/12 cloud on the opening drive.
+    The first RTH bar is evaluated by its own open/close, not yesterday's close.
+
+    SHORT:
+      - 09:33-10:00 window
+      - red wide-range candle
+      - opens above/inside the fast cloud
+      - closes below the fast cloud
+      - volume expansion
+      - stop = candle high
+
+    LONG is the mirror image with stop = candle low.
+    """
+    if not _in_gap_entry_window(bar_time) or len(df_3m) < 2:
+        return "none", 0.0, ""
+
+    cur = df_3m.iloc[-1]
+    entry_price = cur.close
+    if entry_price <= 0:
+        return "none", 0.0, ""
+
+    fast_top = max(cur.ema5, cur.ema12)
+    fast_bot = min(cur.ema5, cur.ema12)
+    body = abs(cur.close - cur.open)
+    full_range = cur.high - cur.low
+    body_pct = body / entry_price
+    range_pct = full_range / entry_price
+    vol_ok = cur.vol_ma20 <= 0 or cur.volume >= OPEN_CLOUD_BREAK_VOL_MULT * cur.vol_ma20
+    wide_enough = (body_pct >= OPEN_CLOUD_BREAK_BODY_PCT and
+                   range_pct >= OPEN_CLOUD_BREAK_RANGE_PCT)
+
+    if not vol_ok or not wide_enough:
+        return "none", 0.0, ""
+
+    red_slice = (cur.close < cur.open and
+                 cur.open >= fast_bot and
+                 cur.close < fast_bot)
+    if red_slice and _stop_ok(entry_price, cur.high, "short"):
+        return "short", cur.high, "open_cloud_break_short"
+
+    green_slice = (cur.close > cur.open and
+                   cur.open <= fast_top and
+                   cur.close > fast_top)
+    if green_slice and _stop_ok(entry_price, cur.low, "long"):
+        return "long", cur.low, "open_cloud_break_long"
+
+    return "none", 0.0, ""
+
+
 # ------------------------------------------------------------------ #
 # 3-min entry signal
 # ------------------------------------------------------------------ #
@@ -315,9 +380,6 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
             return "none", 0.0, ""
 
     # Volume gate — above-average participation confirms the move is real
-    if cur.vol_ma20 > 0 and cur.volume < VOLUME_CONFIRM_MULT * cur.vol_ma20:
-        return "none", 0.0, ""
-
     # Cloud 2 flip: ema5 crosses ema12
     # Grace window: also fire on the 1-2 bars immediately after a flip while
     # C2 is still aligned — catches cases where the flip bar had low volume
@@ -348,49 +410,31 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
             c2_flip_short = True
             flip_late = True
 
-    # Cloud 3 direction: ema34 vs ema50
-    c3_green = cur.ema34 > cur.ema50
-    c3_red   = cur.ema34 < cur.ema50
+    # =================================================================
+    # CORE DAY-TRADING TRIGGER: 5/12 cloud flip.
+    # No C3 (34/50) filter.  No 10m trend filter.  No volume filter.
+    # User decision (2026-05-28): if the lower cloud flips, take the trade.
+    # The 34/50 cloud and 10m trend are LOGGED as context only — never block.
+    # Stop = ema12 with a safety fallback to the candle high/low so a flat
+    # ema12 right at price still produces a usable stop distance.
+    # =================================================================
+    c3_green = cur.ema34 > cur.ema50    # informational only
+    c3_red   = cur.ema34 < cur.ema50    # informational only
 
-    # 10-min trend filter — when confirmed, don't fight the macro trend.
-    # When trend == 'none' (10m not yet aligned), C3 on 3m acts as the bias
-    # filter instead — C2 flip must still agree with C3 direction.
-    # 'bullish' → skip shorts.  'bearish' → skip longs.
-    if trend == "bearish" and c2_flip_long:
-        return "none", 0.0, ""
-    if trend == "bullish" and c2_flip_short:
-        return "none", 0.0, ""
-
-    # Scalp mode: 10m not yet confirmed → C3 on 3m is the only bias filter.
-    # Label these entries differently so performance can be tracked separately.
-    scalp_mode = (trend == "none")
-
-    # ---- LONG: C2 just flipped green (or within grace window), C3 is green ----
-    if c2_flip_long and c3_green:
-        stop = cur.ema50
-        # Rip's support level: if it's higher than ema50, use it — tighter and
-        # more meaningful (break of support = trade is wrong)
-        if support is not None and support > stop and support < entry_price:
-            stop = support
+    if c2_flip_long:
+        # Stop is the LOWER of ema12 vs candle low — whichever gives more room.
+        # If ema12 happens to be above entry (rare on a fresh flip), candle low
+        # carries the stop below entry so _stop_ok still passes.
+        stop = min(cur.ema12, cur.low)
+        reason = "cloud_512_flip+1" if flip_late else "cloud_512_flip"
         if _stop_ok(entry_price, stop, "long"):
-            if scalp_mode:
-                reason = "c3_scalp+1" if flip_late else "c3_scalp"
-            else:
-                reason = "cloud_flip+1" if flip_late else "cloud_flip"
             return "long", stop, reason
 
-    # ---- SHORT: C2 just flipped red (or within grace window), C3 is red ----
-    if c2_flip_short and c3_red:
-        stop = cur.ema50
-        # Rip's resistance level: if it's lower than ema50, use it — tighter
-        # (break back above resistance = trade is wrong)
-        if resistance is not None and resistance < stop and resistance > entry_price:
-            stop = resistance
+    if c2_flip_short:
+        # Stop is the HIGHER of ema12 vs candle high.
+        stop = max(cur.ema12, cur.high)
+        reason = "cloud_512_flip+1" if flip_late else "cloud_512_flip"
         if _stop_ok(entry_price, stop, "short"):
-            if scalp_mode:
-                reason = "c3_scalp+1" if flip_late else "c3_scalp"
-            else:
-                reason = "cloud_flip+1" if flip_late else "cloud_flip"
             return "short", stop, reason
 
     # ---- PMH breakout: first bar to close above pre-market high, C3 green ----
@@ -410,6 +454,84 @@ def get_entry_signal_3m(df_3m: pd.DataFrame, trend: str = None,
             stop = resistance
         if _stop_ok(entry_price, stop, "short"):
             return "short", stop, "pml_breakdown"
+
+    # ---- Cloud continuation — already trending, no flip needed ─────────────
+    # Two variants:
+    #
+    # Variant A  (EMA-crossover, steady trend)
+    #   ema5 crossed ema12 some bars ago and both bars stay aligned.
+    #   Works well for smooth trends with narrow-range bars.
+    #   Requires CONFIRMED 10m trend (reduces pre-market noise).
+    #   Stop = ema12 (near cloud edge).
+    #
+    # Variant B  (close-based, crash / gap-day)
+    #   Ripster EMAs use hl2 = (high+low)/2.  Wide crash / rip bars distort
+    #   ema5 — it stays ABOVE the close even while price collapses, so the
+    #   ema5/ema12 crossover never fires (or fires 30+ min late).
+    #   Instead, check whether the CLOSE price itself is below ema12.
+    #   Because ema5 (hl2-based) > close on bear bars, it serves as a
+    #   natural stop ABOVE the entry — satisfying _stop_ok for a short.
+    #   Allows trend == "none" so it fires on crash-open days where the
+    #   10-min cloud hasn't had time to confirm.
+    #   Stop = ema5 (above close for shorts / below close for longs).
+
+    # Variant A — EMA-crossover continuation
+    c2_bear_cont = prev.ema5 < prev.ema12 and cur.ema5 < cur.ema12
+    if c2_bear_cont and c3_red and trend == "bearish":
+        stop     = cur.ema12
+        dist_pct = (cur.ema12 - entry_price) / entry_price if entry_price > 0 else 1.0
+        if dist_pct <= CLOUD_CONT_MAX_DIST and _stop_ok(entry_price, stop, "short"):
+            return "short", stop, "cloud_cont"
+
+    c2_bull_cont = prev.ema5 > prev.ema12 and cur.ema5 > cur.ema12
+    if c2_bull_cont and c3_green and trend in ("bullish", "none"):
+        stop     = cur.ema12
+        dist_pct = (entry_price - cur.ema12) / entry_price if entry_price > 0 else 1.0
+        if dist_pct <= CLOUD_CONT_MAX_DIST and _stop_ok(entry_price, stop, "long"):
+            return "long", stop, "cloud_cont"
+
+    # Variant B — close-based crash continuation (hl2-distortion specific)
+    #
+    # The hl2 distortion signature: wide crash/rip bars cause ema5 (hl2-based)
+    # to stay ABOVE ema12 even as the actual close price collapses BELOW ema12.
+    # This creates a paradox — the EMA crossover says "bullish" but close says
+    # "bearish."  Variant B fires ONLY in this specific situation:
+    #
+    #   ema5 > ema12      ←  EMA crossover says bullish (hl2 distorted upward)
+    #   close < ema12     ←  but actual close is below the fast cloud top
+    #   ema5  > close     ←  ema5 is above close → valid stop ABOVE entry for short
+    #   price_declining   ←  momentum still negative
+    #
+    # This precisely targets crash-open scenarios and CANNOT fire on normal
+    # bearish continuations (those have ema5 < ema12 and are handled by Variant A).
+
+    c2_ema_says_bull  = cur.ema5   > cur.ema12  # hl2 distortion signature
+    c2_close_below    = cur.close  < cur.ema12  # but close is below cloud top
+    c2_ema5_above_cls = cur.ema5   > cur.close  # ema5 above close → valid short stop
+    price_declining   = cur.close  < prev.close  # momentum still negative
+
+    if c2_ema_says_bull and c2_close_below and c2_ema5_above_cls and price_declining \
+            and trend in ("bearish", "none"):
+        stop     = cur.ema5
+        dist_pct = (stop - entry_price) / entry_price if entry_price > 0 else 1.0
+        if dist_pct <= CLOUD_CONT_MAX_DIST and _stop_ok(entry_price, stop, "short"):
+            return "short", stop, "cloud_cont_crash"
+
+    # Mirror for longs (gap-up / rip scenario):
+    # ema5 < ema12 (hl2 distorted downward), but close > ema12.
+    # Allow trend="none" here as an opening/day-trading reclaim. Waiting for
+    # 10m bullish confirmation misses the first usable lower-cloud turn.
+    c2_ema_says_bear  = cur.ema5   < cur.ema12
+    c2_close_above    = cur.close  > cur.ema12
+    c2_ema5_below_cls = cur.ema5   < cur.close
+    price_rising      = cur.close  > prev.close
+
+    if c2_ema_says_bear and c2_close_above and c2_ema5_below_cls and price_rising \
+            and trend in ("bullish", "none"):
+        stop     = cur.ema5
+        dist_pct = (entry_price - stop) / entry_price if entry_price > 0 else 1.0
+        if dist_pct <= CLOUD_CONT_MAX_DIST and _stop_ok(entry_price, stop, "long"):
+            return "long", stop, "cloud_cont_crash"
 
     return "none", 0.0, ""
 

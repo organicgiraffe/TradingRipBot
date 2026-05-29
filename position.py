@@ -26,6 +26,12 @@ class Position:
     half_exited:     bool  = False  # True once 50% of shares exited at Rip's level
     best_unrealised: float = 0.0   # HWM per-share profit (intrabar-safe ratchet)
 
+    # ── Starter / add-in (pyramiding) ───────────────────────────────────
+    shares_full:     int   = 0     # intended full position size (starter + add)
+    shares_add:      int   = 0     # shares still to add on confirmation
+    add_triggered:   bool  = False # True once the add-in order has been placed
+    add_entry_price: float = 0.0   # price at which the add-in filled
+
     def __post_init__(self):
         # Capture original share count before any partial exits
         if self.original_shares == 0:

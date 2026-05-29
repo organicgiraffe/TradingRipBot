@@ -14,10 +14,12 @@ import sys, yfinance as yf, pandas as pd
 
 sys.path.insert(0, r"C:\Users\nicol\OneDrive\Documents\Tradingbot")
 from ema_engine import (compute_emas, get_trend_10m,
-                        get_entry_signal_3m, get_gap_signal_3m)
+                        get_entry_signal_3m, get_gap_signal_3m,
+                        get_open_cloud_break_signal_3m)
 from config import (
     MIN_BARS_3M, RATCHET_START, RATCHET_GIVEBACK, PROFIT_TARGET_SHARE,
     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
+    STARTER_RATIO, ADD_TRIGGER_PROFIT,
     MAX_TRADES_PER_DAY,
     MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH, MIN_DAILY_RANGE,
     DTR_MAX_PCT, DTR_EXEMPT_ATR, FIRST_ENTRY_MINUTE,
@@ -27,16 +29,10 @@ from config import (
 )
 
 PLAN = {
-    "TSLA":  {"support": 428.50, "resistance": 431.50},
-    "NVDA":  {"support": 217.00, "resistance": 219.00},
-    "AMD":   {"support": 481.40, "resistance": 484.20},
-    "META":  {"support": 608.00, "resistance": 611.00},
-    "GOOGL": {"support": 383.00, "resistance": 385.00},
-    "MU":    {"support": 805.00, "resistance": 818.68},
-    "IONQ":  {"support":  63.80, "resistance":  65.00},
-    "OKLO":  {"support":  71.00, "resistance":  73.00},
+    "MU":   {"support":  950.00, "resistance":  970.00},
+    "SNDK": {"support": 1625.00, "resistance": 1635.00},
 }
-TODAY = pd.Timestamp("2026-05-26").date()
+TODAY = pd.Timestamp("2026-05-27").date()
 ENABLE_GAP_ENTRIES = "--cloud-only" not in sys.argv and "--no-gap" not in sys.argv
 
 
@@ -60,6 +56,7 @@ def download_and_resample(sym):
     today_pre = df[df.index.date == TODAY].between_time("04:00", "09:29")
     pmh = float(today_pre["high"].max()) if not today_pre.empty else None
     pml = float(today_pre["low"].min()) if not today_pre.empty else None
+    df_all = df.between_time("04:00", "15:59")
     df = df.between_time("09:30", "15:59")
     # 1-min bars for today — index labeled with close time (open + 1 min).
     # Used for intrabar ratchet/stop management so we see peaks within each
@@ -67,7 +64,8 @@ def download_and_resample(sym):
     df1_today = df[df.index.date == TODAY].copy()
     df1_today.index = df1_today.index + pd.Timedelta(minutes=1)
     def rsmp(m):
-        r = df.resample(f"{m}min", closed="left", label="left").agg(
+        src = df_all if m == 3 else df
+        r = src.resample(f"{m}min", closed="left", label="left").agg(
             open=("open","first"), high=("high","max"),
             low=("low","min"), close=("close","last"), volume=("volume","sum")
         ).dropna(subset=["close"])
@@ -89,7 +87,13 @@ def trail_stop(sig, stop, entry, best, ema50):
     else:
         if best >= RATCHET_START:
             t = min(t, entry - max(0.0, best - RATCHET_GIVEBACK))
-        return min(stop, t)
+        new = min(stop, t)
+        # Guard: crash entries have ema50 << entry, which would immediately trail
+        # the stop below entry and trigger on the next bar.  Don't move the stop
+        # below entry_price until the ratchet has activated ($3 profit seen).
+        if best < RATCHET_START and new < entry:
+            return stop   # keep initial risk stop unchanged
+        return new
 
 
 # ── Download all data upfront ─────────────────────────────────────────────────
@@ -190,6 +194,34 @@ for bt in all_times:
                 if exit_px is not None:
                     break
 
+                # Step 0 — Add-in trigger (before stop update so the ratchet
+                # starts from the new average entry, not the starter entry)
+                if not t["add_triggered"] and t["add_shares"] > 0:
+                    starter_profit = (
+                        (t["entry"] - m1["close"]) if sig == "short"
+                        else (m1["close"] - t["entry"])
+                    )
+                    if starter_profit >= ADD_TRIGGER_PROFIT:
+                        add_px  = m1["close"]
+                        s_sh    = t["remaining"]   # shares already open
+                        a_sh    = t["add_shares"]
+                        tot_sh  = s_sh + a_sh
+                        avg_px  = (t["entry"] * s_sh + add_px * a_sh) / tot_sh
+                        # Update trade state to reflect full position.
+                        # t["shares"] stays as starter count (display/risk).
+                        # t["remaining"] tracks the live share count.
+                        t["entry"]        = avg_px
+                        t["remaining"]    = tot_sh
+                        t["add_triggered"] = True
+                        t["add_entry"]    = add_px
+                        # best_unr restarts from new average entry
+                        t["best_unr"]     = max(0.0, (avg_px - m1["close"])
+                                                      if sig == "short"
+                                                      else (m1["close"] - avg_px))
+                        # level_ahead still relative to original entry price
+                        # (don't recalculate — it was set at trade open)
+                        entry = avg_px   # local var used by ratchet/stop below
+
                 # Step 1 — Update trailing stop using PREVIOUS best_unr
                 t["stop_cur"] = trail_stop(sig, t["stop_cur"], entry,
                                            t["best_unr"], cur.ema50)
@@ -204,10 +236,15 @@ for bt in all_times:
                     if hpx is None and not level_ahead and m1_unr >= PROFIT_TARGET_SHARE:
                         hpx = m1["close"]; hrsn = "half@target"
                     if hpx is not None:
-                        hp = ((hpx-entry) if sig=="long" else (entry-hpx)) * (shares//2)
+                        # Use actual remaining shares for half-exit — not sym_data
+                        # full-position count.  If add hasn't triggered yet, remaining
+                        # is starter-only (e.g. 25sh); if add triggered, remaining is
+                        # the full position (e.g. 50sh).  Both cases handled correctly.
+                        half_sh = t["remaining"] // 2
+                        hp = ((hpx-entry) if sig=="long" else (entry-hpx)) * half_sh
                         if hp > 0:
                             t["half_pnl"]  = hp
-                            t["remaining"] = shares - shares//2
+                            t["remaining"] -= half_sh
                         t["half_done"] = True
 
                 # Step 3 — Hard stop using 1-min low/high
@@ -239,12 +276,15 @@ for bt in all_times:
             held_m  = int((fbt - t["entry_t"]).total_seconds()//60)
             all_trades.append({
                 "sym": sym, "time": t["entry_t"], "sig": sig.upper(),
-                "entry": entry, "stop": t["init_stop"],
-                "dist": t["dist"], "shares": shares, "risk": t["dist"]*shares,
+                "entry": t.get("original_entry", entry), "avg_entry": entry,
+                "stop": t["init_stop"],
+                "dist": t["dist"], "shares": t["shares"], "risk": t["dist"]*t["shares"],
                 "reason": t["reason"], "trend": t["trend"],
                 "half_pnl": t["half_pnl"], "runner_pnl": runner, "total_pnl": total,
                 "exit_px": exit_px, "exit_t": fbt, "exit_why": exit_why,
                 "held": held_m, "peak": t["peak_unr"],
+                "add_triggered": t["add_triggered"], "add_entry": t["add_entry"],
+                "shares_full": t["shares_full"],
             })
             trades_today[sym] += 1
             in_trade   = False
@@ -276,34 +316,64 @@ for bt in all_times:
         trend = get_trend_10m(df10e)
 
         if ENABLE_GAP_ENTRIES:
-            sig, stop_px, reason = get_gap_signal_3m(
-                df3e, bar_time=bt.to_pydatetime(), pmh=pmh,
-                support=sup, resistance=res)
+            sig, stop_px, reason = get_open_cloud_break_signal_3m(
+                df3e, bar_time=bt.to_pydatetime())
+            if sig == "none":
+                sig, stop_px, reason = get_gap_signal_3m(
+                    df3e, bar_time=bt.to_pydatetime(), pmh=pmh,
+                    support=sup, resistance=res)
         else:
             sig, stop_px, reason = "none", None, ""
         is_gap_entry = sig != "none"
         if sig == "none":
+            # cloud_cont_crash is a crash-day starter — allowed before FIRST_ENTRY_MINUTE
+            # (same treatment as gap signals).  All other signals wait until 09:40.
+            is_crash_starter = False
             if bt.hour == 9 and bt.minute < FIRST_ENTRY_MINUTE:
-                continue
-            sig, stop_px, reason = get_entry_signal_3m(
-                df3e, trend, bar_time=bt.to_pydatetime(),
-                support=sup, resistance=res)
+                # Peek at the signal without committing — only crash starters pass early
+                _sig, _stop, _rsn = get_entry_signal_3m(
+                    df3e, trend, bar_time=bt.to_pydatetime(),
+                    support=sup, resistance=res)
+                if _rsn == "cloud_cont_crash":
+                    sig, stop_px, reason = _sig, _stop, _rsn
+                    is_crash_starter = True
+                else:
+                    continue   # too early for non-crash signals
+            else:
+                sig, stop_px, reason = get_entry_signal_3m(
+                    df3e, trend, bar_time=bt.to_pydatetime(),
+                    support=sup, resistance=res)
         if sig == "none": continue
+
+        # Shares: full intended size; starter enters at STARTER_RATIO of that
+        shares_full  = shares   # already set per-symbol above
+        shares_start = max(1, int(shares_full * STARTER_RATIO))
+        shares_add   = shares_full - shares_start
 
         entry     = df3e.iloc[-1].close
         stop_dist = abs(entry - stop_px)
-        risk      = stop_dist * shares
+        # Risk check uses STARTER shares only (starter is the max we risk initially)
+        risk      = stop_dist * shares_start
         risk_cap  = MAX_RISK_DOLLARS_HIGH if entry >= HIGH_PRICE_THRESHOLD else MAX_RISK_DOLLARS
         if risk > risk_cap: continue
-        if not is_gap_entry and sig=="long"  and res and entry > res*(1+LEVEL_PROX_LONG):  continue
-        if not is_gap_entry and sig=="short" and sup and entry < sup*(1-LEVEL_PROX_SHORT): continue
+        # cloud_cont signals are by definition for stocks already past the key level —
+        # applying the proximity filter on top would block every valid continuation entry.
+        # Gap entries are also exempt (is_gap_entry).
+        is_cont_signal = (reason in ("cloud_cont", "cloud_cont_crash") or
+                          reason.startswith("cloud_512_flip"))
+        if not is_gap_entry and not is_cont_signal and sig=="long"  and res and entry > res*(1+LEVEL_PROX_LONG):  continue
+        if not is_gap_entry and not is_cont_signal and sig=="short" and sup and entry < sup*(1-LEVEL_PROX_SHORT): continue
 
         candidates.append({
             "sym": sym, "sig": sig, "entry": entry, "entry_t": bt,
+            "original_entry": entry,
             "init_stop": stop_px, "stop_cur": stop_px, "dist": stop_dist,
-            "reason": reason, "trend": trend, "shares": shares,
+            "reason": reason, "trend": trend,
+            "shares": shares_start, "remaining": shares_start,
+            "shares_full": shares_full, "add_shares": shares_add,
+            "add_triggered": False, "add_entry": None,
             "best_unr": 0.0, "peak_unr": 0.0,
-            "half_done": False, "half_pnl": 0.0, "remaining": shares,
+            "half_done": False, "half_pnl": 0.0,
             "atr": sym_atr.get(sym, 0),
         })
 
@@ -325,25 +395,38 @@ if in_trade and open_trade:
     held_m  = int((fbt - t["entry_t"]).total_seconds()//60)
     all_trades.append({
         "sym": sym, "time": t["entry_t"], "sig": t["sig"].upper(),
-        "entry": t["entry"], "stop": t["init_stop"],
-        "dist": t["dist"], "shares": shares, "risk": t["dist"]*shares,
+        "entry": t.get("original_entry", t["entry"]), "avg_entry": t["entry"],
+        "stop": t["init_stop"],
+        "dist": t["dist"], "shares": t["shares"], "risk": t["dist"]*t["shares"],
         "reason": t["reason"], "trend": t["trend"],
         "half_pnl": t["half_pnl"], "runner_pnl": runner, "total_pnl": total,
         "exit_px": exit_px, "exit_t": fbt, "exit_why": "eod_close",
         "held": held_m, "peak": t["peak_unr"],
+        "add_triggered": t["add_triggered"], "add_entry": t["add_entry"],
+        "shares_full": t["shares_full"],
     })
 
 # ── Print ─────────────────────────────────────────────────────────────────────
 HDR = (f"  {'#':<2}  {'TIME':<5}  {'SYM':<5}  {'DIR':<5}  {'ENTRY':>7}  "
-       f"{'STOP':>7}  {'RISK':>4}  {'PEAK/SH':>7}  {'P&L':>7}  "
+       f"{'STOP':>7}  {'SH':>4}  {'PEAK/SH':>7}  {'P&L':>7}  "
        f"{'HELD':>4}  {'EXIT':<13}  SIGNAL")
 print(HDR)
-print(f"  {'-'*112}")
+print(f"  {'-'*115}")
 
 for n, r in enumerate(all_trades, 1):
     sign = "+" if r["total_pnl"]>=0 else "-"
     pk   = f"+${r['peak']:.2f}" if r["peak"]>=0 else f"-${abs(r['peak']):.2f}"
     tag  = "WIN" if r["total_pnl"]>0 else ("SCR" if abs(r["total_pnl"])<20 else "LOS")
+    # Shares display: "25+25=50" when add triggered, "25(+25)" when not yet.
+    # r["shares"] = starter count (never overwritten by add).
+    # r["shares_full"] = full intended position.
+    s_start = r["shares"]
+    s_full  = r.get("shares_full", s_start)
+    s_add   = s_full - s_start
+    sh_str  = f"{s_start}+{s_add}={s_full}" if r.get("add_triggered") else f"{s_start}(+{s_add})"
+    add_note = ""
+    if r.get("add_triggered") and r.get("add_entry"):
+        add_note = f"  ADD@${r['add_entry']:.2f} avg=${r.get('avg_entry', r['entry']):.2f}"
     extra = ""
     if r["half_pnl"]:
         rs = "+" if r["runner_pnl"]>=0 else "-"
@@ -351,9 +434,9 @@ for n, r in enumerate(all_trades, 1):
                  f"runner {rs}${abs(r['runner_pnl']):.0f})")
     print(
         f"  {n:<2}  {r['time'].strftime('%H:%M')}  {r['sym']:<5}  {r['sig']:<5}  "
-        f"${r['entry']:>6.2f}  ${r['stop']:>6.2f}  ${r['risk']:>4.0f}  "
+        f"${r['entry']:>6.2f}  ${r['stop']:>6.2f}  {sh_str:<10}  "
         f"{pk:>7}  {sign}${abs(r['total_pnl']):>5.0f}  {r['held']:>4}m  "
-        f"{r['exit_why']:<13}  [{r['reason']}] 10m={r['trend']}  {tag}{extra}"
+        f"{r['exit_why']:<13}  [{r['reason']}] 10m={r['trend']}  {tag}{add_note}{extra}"
     )
 
 print(f"  {'-'*112}")

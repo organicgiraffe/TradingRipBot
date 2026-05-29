@@ -39,39 +39,57 @@ MAX_RISK_PER_TRADE   = 200.0  # max $ at risk per trade — shares are sized dyn
 MIN_SHARES           = 1      # never go below 1 share
 
 # ── $500/day target parameters ────────────────────────────────────────────────
-FIXED_SHARES         = 100    # flat 100 shares per position (stocks under HIGH_PRICE_THRESHOLD)
-FIXED_SHARES_HIGH    = 50     # 50 shares for expensive stocks ($500+)
+FIXED_SHARES         = 100    # full position size (stocks under HIGH_PRICE_THRESHOLD)
+FIXED_SHARES_HIGH    = 50     # full position size for expensive stocks ($500+)
 HIGH_PRICE_THRESHOLD = 500.0  # entry price at or above this → use FIXED_SHARES_HIGH
                                # catches META ~$610, CRWD ~$565, MU ~$800, SNDK ~$1000+
+# ── Starter + add-in (pyramiding) ────────────────────────────────────────────
+STARTER_RATIO        = 0.50   # first entry = 50% of full intended shares
+                               # MU (50sh full) → 25 starter;  others (100sh) → 50 starter
+ADD_TRIGGER_PROFIT   = 3.00   # add remaining shares when starter is up $3+/share
+                               # matches RATCHET_START — trade has proven itself before we press it
+# ─────────────────────────────────────────────────────────────────────────────
 PROFIT_TARGET_SHARE  = 5.00   # exit at +$5/share = $500 profit on 100 shares
-MIN_DAILY_RANGE      = 10.00  # skip stock if 5-day avg daily range < $10
-                               # $10 ATR minimum: at $5/share target you need room to breathe
-                               # MU $54, ARM $27, AMD $24 pass; NVDA $6, OKLO $4 fail
-                               # TSLA ~$11 borderline — keep it, strong brand + Rip coverage
-MIN_STOP_DIST        = 0.40   # absolute floor (legacy) — superseded by MIN_STOP_PCT_LOWER below
+MIN_DAILY_RANGE      = 0.30   # absolute-dollar floor — penny-stock guard only ($0.30 min ATR)
+                               # was $5/$10 — blocked ONDS-style movers (low price, huge %).
+                               # Real filter is now percentage-based below.
+MIN_DAILY_RANGE_PCT  = 0.025  # 2.5% — 5-day avg range must be ≥ 2.5% of stock price
+                               # ONDS $12 with $1 ATR = 8.3% → allowed
+                               # MU $900 with $76 ATR = 8.4% → allowed
+                               # MSFT $420 with $11 ATR = 2.6% → borderline allowed
+                               # AAPL $300 with $4 ATR = 1.3% → blocked (no intraday range)
+MIN_STOP_DIST        = 0.05   # absolute floor — pennies only.  MIN_STOP_PCT_LOWER (0.25%) is the real filter.
+                               # was $0.40 — blocked ONDS 09:36 flip with $0.399 stop dist by 0.1 cent.
 MIN_STOP_PCT_LOWER   = 0.0025 # 0.25% of price — stops tighter than this are noise, not signal
                               # META $605 + $0.68 stop = 0.11% → blocked
                               # AMZN $264 + $0.97 stop = 0.37% → allowed
 CLOUD_EXIT_BUFFER    = 0.10   # price must close at least $0.10 PAST ema34 to exit
+CLOUD_CONT_MAX_DIST  = 0.025  # cloud_cont: max distance price can be from ema12
+                               # before the signal is considered too extended to enter
+                               # 2.5%: MU at $960 with ema12=$985 → 2.6% → blocked
+                               #        MU at $975 with ema12=$985 → 1.0% → allowed
                               # prevents false exits when price just grazes the cloud edge
 GAP_THRESHOLD        = 0.020  # ema50 > 2.0% from price = Day1 gap-up/down catalyst play
                               # above this: use ema12 as tighter stop, allow TYPE 1b entry
-FIRST_ENTRY_MINUTE   = 40     # no entries before 09:40 — skip the first 5-min chaos
+FIRST_ENTRY_MINUTE   = 33     # first completed 3-min bar — trade the 5/12 cloud flip from the open
                                # 9:40-9:44 setups are valid; $700 risk cap handles disasters
 GAP_ENTRY_START_HOUR   = 9     # Gap & Go / Gap & Crap opening-drive window
 GAP_ENTRY_START_MINUTE = 33    # first completed 3-min bar
 GAP_ENTRY_END_HOUR     = 10
 GAP_ENTRY_END_MINUTE   = 0     # inclusive: allow the 10:00 bar close
+OPEN_CLOUD_BREAK_BODY_PCT = 0.004  # opening cloud break: candle body >= 0.4%
+OPEN_CLOUD_BREAK_RANGE_PCT = 0.008 # opening cloud break: full range >= 0.8%
+OPEN_CLOUD_BREAK_VOL_MULT = 1.2    # opening cloud break: volume expansion vs 20-bar avg
 LAST_ENTRY_HOUR      = 15     # no new entries at or after this hour (ET)
 LAST_ENTRY_MINUTE    = 0      # → 15:00  gives at least 50 min for trade to develop
-FRIDAY_OPEN_MINUTE   = 45     # Lotto Friday: hold extra 5 min — first entry 09:45
+FRIDAY_OPEN_MINUTE   = 33     # keep the same 5/12 cloud flip start on Fridays
 MAX_RISK_DOLLARS     = 700    # skip any trade where stop_dist × shares > $700
                                # TSLA normal risk ~$550 → allowed
                                # MU Mar-31 open trade $716 → blocked (plus time filter)
 MAX_RISK_DOLLARS_HIGH = 900   # separate cap for stocks >= HIGH_PRICE_THRESHOLD ($500+)
                                # MU $886 entry, stop $872 → $14.65 × 50sh = $732 → allowed
                                # prevents blocking big movers just because their $ stop is wide
-MAX_SIMULTANEOUS_POSITIONS = 1   # one quality trade at a time — two positions cancel each other out
+MAX_SIMULTANEOUS_POSITIONS = 2   # allow 2 concurrent trades — second slot catches HOOD/ZS while MU/SNDK runs
 
 # Level proximity — entry must be NEAR Rip's level, not chasing mid-range
 # Long:  entry must be below resistance + 1.5%  (at support or fresh breakout only)
@@ -84,10 +102,18 @@ LEVEL_PROX_SHORT = 0.020   # 2.0% below support    = max allowed for a short ent
 # Example: if ATR = $7.59 and DTR so far = $6.21, ratio = 82% — skip the trade.
 ATR_PERIODS  = 14     # trading days for ATR lookback
 DTR_MAX_PCT  = 0.75   # skip entry when DTR >= 75% of ATR (move is largely done)
-DTR_EXEMPT_ATR = 30.0 # stocks with 5-day ATR above this skip the DTR filter entirely
-                       # high-ATR momentum stocks (MU $54, AMD $25+ on catalyst days)
-                       # run beyond their average on breakout days — DTR blocks the best trades
-                       # ARM $27 stays under the threshold → DTR still applies → correctly blocked
+DTR_EXEMPT_ATR = 5.0  # stocks with 5-day ATR above this skip the DTR filter entirely
+                       # matched to MIN_DAILY_RANGE so any stock passing the ATR minimum
+                       # is also DTR-exempt — on catalyst/news days stocks routinely run
+                       # 2x-3x their average range; DTR filter was blocking the best trades
+                       # (was 30.0 — only SNDK/MU exempt; AMD/META/TSLA/AVGO were blocked)
+
+# ── Paper account data delay ──────────────────────────────────────────────────
+# IBKR paper accounts serve market data 15 minutes delayed.
+# Setting this to 15 shifts all entry-gate and signal-window comparisons back
+# so they align with the actual bar times we're seeing.
+# On live accounts (port 7496) this value is ignored — no offset applied.
+PAPER_DATA_DELAY_MINUTES = 0    # set to 15 if paper account loses real-time data sharing
 
 # ── Debug output ──────────────────────────────────────────────────────────────
 DEBUG_SIGNALS = True   # print a status line every 3m bar + BLOCKED reasons

@@ -1,0 +1,128 @@
+// ================================================================
+// Ripster Bot Alert v1.0
+// ================================================================
+// Paste this into TradingView Pine Script Editor.
+// Detects the same signals as the Python bot:
+//   - cloud_flip long/short  (C2 flips with C3 aligned + volume)
+//   - c3_scalp long/short    (C2 flips when C3 neutral)
+//   - open_cloud_break       (opening drive 09:33-10:00 ET)
+//
+// After adding to chart, create ONE ALERT PER SIGNAL TYPE per symbol.
+// Set frequency: "Once Per Bar Close"
+// Set webhook URL: your ngrok URL + /webhook
+// ================================================================
+
+//@version=5
+indicator("Ripster Bot Alert", overlay=true, max_bars_back=500)
+
+// ── EMA source: hl2 = (high+low)/2, matches Ripster PineScript ──────────────
+src = hl2
+
+ema5   = ta.ema(src, 5)
+ema12  = ta.ema(src, 12)
+ema34  = ta.ema(src, 34)
+ema50  = ta.ema(src, 50)
+ema200 = ta.ema(src, 200)
+
+// ── Cloud states ─────────────────────────────────────────────────────────────
+c2_bull = ema5 > ema12     // Cloud 2 green (fast)
+c2_bear = ema5 < ema12     // Cloud 2 red
+
+c3_bull = ema34 > ema50    // Cloud 3 green (slow trend)
+c3_bear = ema34 < ema50    // Cloud 3 red
+
+// ── C2 flip this bar ─────────────────────────────────────────────────────────
+c2_flip_long  = ta.crossover(ema5, ema12)   // red -> green
+c2_flip_short = ta.crossunder(ema5, ema12)  // green -> red
+
+// ── Volume filter ────────────────────────────────────────────────────────────
+vol_ma20 = ta.sma(volume, 20)
+vol_ok   = volume >= 0.8 * vol_ma20   // must be at least 80% of average
+
+// ── Session time helpers (US Eastern) ────────────────────────────────────────
+et_hour   = hour(time, "America/New_York")
+et_minute = minute(time, "America/New_York")
+et_mins   = et_hour * 60 + et_minute
+
+// Opening drive window: 09:33 to 10:00 ET (inclusive)
+gap_start = 9 * 60 + 33   // 573
+gap_end   = 10 * 60 + 0   // 600
+in_gap_window = (et_mins >= gap_start and et_mins <= gap_end)
+
+// Regular session: 09:33 to 15:50 ET
+in_session = (et_mins >= gap_start and et_mins <= 15 * 60 + 50)
+
+// ── SIGNAL DEFINITIONS ───────────────────────────────────────────────────────
+
+// --- cloud_flip LONG ---
+// C2 flips green, C3 is green (confirmed trend), volume OK, within session
+long_flip = c2_flip_long and c3_bull and vol_ok and in_session
+
+// --- cloud_flip SHORT ---
+// C2 flips red, C3 is red, volume OK, within session
+short_flip = c2_flip_short and c3_bear and vol_ok and in_session
+
+// --- c3_scalp LONG ---
+// C2 flips green but C3 neutral (not bearish), volume OK
+// Use for momentum scalps when trend is unclear
+scalp_long = c2_flip_long and not c3_bear and vol_ok and in_session and not long_flip
+
+// --- c3_scalp SHORT ---
+scalp_short = c2_flip_short and not c3_bull and vol_ok and in_session and not short_flip
+
+// --- open_cloud_break SHORT ---
+// Opening drive: red bar opens inside/above fast cloud, closes BELOW it
+fast_top = math.max(ema5, ema12)
+fast_bot = math.min(ema5, ema12)
+
+body      = math.abs(close - open_)
+full_rng  = high - low
+body_pct  = body / close
+range_pct = full_rng / close
+
+ocb_short = (in_gap_window and
+             close < open_ and
+             open_ >= fast_bot and
+             close < fast_bot and
+             body_pct  >= 0.004 and
+             range_pct >= 0.008 and
+             volume >= 1.2 * vol_ma20)
+
+// --- open_cloud_break LONG ---
+// Opening drive: green bar opens inside/below fast cloud, closes ABOVE it
+ocb_long  = (in_gap_window and
+             close > open_ and
+             open_ <= fast_top and
+             close > fast_top and
+             body_pct  >= 0.004 and
+             range_pct >= 0.008 and
+             volume >= 1.2 * vol_ma20)
+
+// ── PLOTS (referenced in alert message via plot_0, plot_1, etc.) ─────────────
+// plot_0 = ema50  (used as stop price in alert JSON)
+// plot_1 = ema34
+// plot_2 = ema5
+// plot_3 = ema12
+plot(ema50, "EMA50", color=color.new(color.orange, 0), linewidth=1)
+plot(ema34, "EMA34", color=color.new(color.blue,   0), linewidth=1)
+plot(ema5,  "EMA5",  color=color.new(color.green,  70), linewidth=1)
+plot(ema12, "EMA12", color=color.new(color.red,    70), linewidth=1)
+
+// Visual signals on chart
+plotshape(long_flip,   title="LONG flip",   style=shape.triangleup,   location=location.belowbar, color=color.green,  size=size.small)
+plotshape(short_flip,  title="SHORT flip",  style=shape.triangledown, location=location.abovebar, color=color.red,    size=size.small)
+plotshape(scalp_long,  title="SCALP long",  style=shape.triangleup,   location=location.belowbar, color=color.lime,   size=size.tiny)
+plotshape(scalp_short, title="SCALP short", style=shape.triangledown, location=location.abovebar, color=color.orange, size=size.tiny)
+plotshape(ocb_long,    title="OCB long",    style=shape.labelup,      location=location.belowbar, color=color.teal,   size=size.small, text="OCB")
+plotshape(ocb_short,   title="OCB short",   style=shape.labeldown,    location=location.abovebar, color=color.purple, size=size.small, text="OCB")
+
+// ── ALERT CONDITIONS ─────────────────────────────────────────────────────────
+// Create one alert per condition in TradingView.
+// Set frequency: "Once Per Bar Close" for all alerts.
+
+alertcondition(long_flip,   title="LONG cloud_flip",         message="LONG cloud_flip")
+alertcondition(short_flip,  title="SHORT cloud_flip",        message="SHORT cloud_flip")
+alertcondition(scalp_long,  title="LONG c3_scalp",           message="LONG c3_scalp")
+alertcondition(scalp_short, title="SHORT c3_scalp",          message="SHORT c3_scalp")
+alertcondition(ocb_long,    title="LONG open_cloud_break",   message="LONG open_cloud_break")
+alertcondition(ocb_short,   title="SHORT open_cloud_break",  message="SHORT open_cloud_break")

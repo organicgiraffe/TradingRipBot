@@ -21,6 +21,7 @@ from config import (EMA_PERIODS, MIN_BARS_3M, MIN_BARS_10M,
                     FIRST_ENTRY_MINUTE, MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH,
                     LEVEL_PROX_LONG, LEVEL_PROX_SHORT)
 from ema_engine import (get_trend_10m, get_entry_signal_3m, get_gap_signal_3m,
+                        get_open_cloud_break_signal_3m,
                         should_exit_10m, should_exit_rvol,
                         compute_trailing_stop, compute_dtr_atr_ratio)
 
@@ -79,8 +80,10 @@ def load_symbols(symbols: list) -> dict:
         if isinstance(raw5.columns, pd.MultiIndex):
             raw5.columns = raw5.columns.get_level_values(0)
         raw5 = raw5.tz_convert("US/Eastern")
-        raw5_rth = raw5.between_time("09:30", "16:00")
-        df_10m = _resample(raw5_rth, "10min")
+        # useRTH=False equivalent: include pre-market (04:00) so EMAs reflect
+        # overnight/pre-market price action, matching ibkr_client.py useRTH=False
+        raw5_ext = raw5.between_time("04:00", "16:00")
+        df_10m = _resample(raw5_ext, "10min")
 
         # ---- 1m feed (7d) — signal bars + pre-market levels ------------
         raw1 = yf.download(sym, period="7d", interval="1m",
@@ -99,8 +102,8 @@ def load_symbols(symbols: list) -> dict:
                 pmh_by[_dt] = float(_grp["High"].max())
                 pml_by[_dt] = float(_grp["Low"].min())
 
-        raw1_rth = raw1.between_time("09:30", "16:00")
-        df_3m = _resample(raw1_rth, "3min")
+        raw1_intraday = raw1.between_time("04:00", "16:00")
+        df_3m = _resample(raw1_intraday, "3min")
 
         sym_data[sym] = {"df_3m": df_3m, "df_10m": df_10m,
                          "pmh_by": pmh_by, "pml_by": pml_by,
@@ -132,9 +135,9 @@ def load_symbols_5m(symbols: list) -> dict:
                 pmh_by[_dt] = float(_grp["High"].max())
                 pml_by[_dt] = float(_grp["Low"].min())
 
-        raw5_rth = raw5.between_time("09:30", "16:00")
-        df_3m  = _resample(raw5_rth, "5min")   # 5m bars used as signal proxy
-        df_10m = _resample(raw5_rth, "10min")
+        raw5_intraday = raw5.between_time("04:00", "16:00")
+        df_3m  = _resample(raw5_intraday, "5min")   # 5m bars used as signal proxy
+        df_10m = _resample(raw5_intraday, "10min")  # pre-market included (useRTH=False match)
 
         sym_data[sym] = {"df_3m": df_3m, "df_10m": df_10m,
                          "pmh_by": pmh_by, "pml_by": pml_by,
@@ -353,19 +356,31 @@ def sim_day(target: datetime.date, sym_data: dict,
             pmh   = sym_data[sym]["pmh_by"].get(target)
             pml   = sym_data[sym]["pml_by"].get(target)
 
-            # DTR/ATR gate — skip if today's range is already ≥ 75% spent
-            # e.g. Rip's sheet: "DTR: 6.21 vs ATR: 7.59  82%" → skip entry
+            # DTR/ATR gate — skip if today's range is already ≥ 75% spent.
+            # EXEMPT: stocks with absolute ATR ≥ DTR_EXEMPT_ATR ($10) OR
+            #         stocks whose ATR/price is ≥ 5% (small-cap monsters).
+            # ONDS $12 stock with $1 ATR = 8.3% → exempt → gap-and-go allowed.
+            # Catalyst/news days routinely consume 2-3x average range; for these
+            # high-volatility names the DTR filter blocks the best trades.
             dtr_ratio = compute_dtr_atr_ratio(df10_now, target,
                                               bar_time=bar_time)
-            dtr_exempt = avg_range_by.get(sym, 0.0) >= DTR_EXEMPT_ATR
+            _avg = avg_range_by.get(sym, 0.0)
+            _px  = float(cur["close"])
+            _vol_pct = (_avg / _px) if _px > 0 else 0.0
+            dtr_exempt = (_avg >= DTR_EXEMPT_ATR) or (_vol_pct >= 0.030)
             if dtr_ratio > DTR_MAX_PCT and not dtr_exempt:
-                # Uncomment to debug: print(f"  DTR filter: {sym} {dtr_ratio:.0%} of ATR")
                 continue
 
-            # Daily range filter — 5-day avg range must be ≥ $7 so a $5 move is realistic
+            # Daily range filter — must move ≥ MIN_DAILY_RANGE_PCT of price per day.
+            # Percentage-based so it works across $5 and $1500 stocks alike.
+            # Absolute MIN_DAILY_RANGE acts only as a penny-stock floor ($0.30).
+            from config import MIN_DAILY_RANGE_PCT
             avg_range = avg_range_by.get(sym, 0.0)
-            if avg_range and avg_range < MIN_DAILY_RANGE:
-                continue   # stock doesn't move enough to hit $5 target reliably
+            _price = float(cur["close"])
+            _range_pct = avg_range / _price if _price > 0 else 0.0
+            if avg_range and (avg_range < MIN_DAILY_RANGE or
+                              _range_pct < MIN_DAILY_RANGE_PCT):
+                continue   # stock doesn't move enough relative to its price
 
             # Pull Rip's levels + bias for this symbol (if plan provided)
             plan  = (daily_plan or {}).get(sym, {})
@@ -374,9 +389,12 @@ def sim_day(target: datetime.date, sym_data: dict,
             res   = plan.get("resistance")
 
             if enable_gap:
-                signal, stop_price, entry_reason = get_gap_signal_3m(
-                    df3_now, bar_time=bar_time, pmh=pmh,
-                    support=sup, resistance=res)
+                signal, stop_price, entry_reason = get_open_cloud_break_signal_3m(
+                    df3_now, bar_time=bar_time)
+                if signal == "none":
+                    signal, stop_price, entry_reason = get_gap_signal_3m(
+                        df3_now, bar_time=bar_time, pmh=pmh,
+                        support=sup, resistance=res)
             else:
                 signal, stop_price, entry_reason = "none", None, ""
             is_gap_entry = signal != "none"
@@ -399,11 +417,12 @@ def sim_day(target: datetime.date, sym_data: dict,
             # Long:  must be ≤ resistance + 1.5%  (at support, or fresh breakout)
             # Short: must be ≥ support   - 2.0%   (at resistance, or fresh breakdown)
             # When no level provided (symbol on plan but level unknown), skip check.
-            if not is_gap_entry and signal == "long" and res is not None:
+            is_cloud_512 = entry_reason.startswith("cloud_512_flip")
+            if not is_gap_entry and not is_cloud_512 and signal == "long" and res is not None:
                 if entry_price > res * (1 + LEVEL_PROX_LONG):
                     continue   # chasing — price already too far above resistance
 
-            if not is_gap_entry and signal == "short" and sup is not None:
+            if not is_gap_entry and not is_cloud_512 and signal == "short" and sup is not None:
                 if entry_price < sup * (1 - LEVEL_PROX_SHORT):
                     continue   # chasing — price already too far below support
 
@@ -443,7 +462,7 @@ if __name__ == "__main__":
     WATCHLIST = [
         "TSLA", "NVDA", "AAPL", "META", "AMD",
         "MSFT", "GOOGL", "AMZN", "NFLX", "CRWD",
-        "MU", "SNDK",   # momentum stocks — rules-only, no Rip level filter
+        "MU", "SNDK", "ARM", "AVGO",   # momentum/news names
     ]
 
     # ── Rip's daily plans (screenshot → dict) ─────────────────────────────
@@ -602,6 +621,14 @@ if __name__ == "__main__":
             "NFLX":  {"support":  88.00, "resistance":  88.30},
             "MU":    {"support": 805.00, "resistance": 818.68},
         },
+        # May 27 — from live bot plan/log levels
+        datetime.date(2026, 5, 27): {
+            "SNDK":  {"support": 1625.00, "resistance": 1635.00},
+            "MU":    {"support":  950.00, "resistance":  970.00},
+            "ARM":   {"support":  321.57, "resistance":  323.43},
+            "AMD":   {"support":  507.00, "resistance":  513.00},
+            "AVGO":  {"support":  427.23, "resistance":  431.00},
+        },
     }
     # ──────────────────────────────────────────────────────────────────────
 
@@ -657,6 +684,27 @@ if __name__ == "__main__":
         else:
             print("  No trades.")
         all_plan_results.append((target, len(day_trades), day_wins, day_loss, day_pnl, "1m"))
+
+    if "--last5-only" in sys.argv:
+        recent_trades = all_plan_trades
+        recent_wins   = [t for t in recent_trades if t["pnl"] > 0]
+        recent_losses = [t for t in recent_trades if t["pnl"] <= 0]
+        recent_total  = sum(t["pnl"] for t in recent_trades)
+
+        print(f"\n{'='*60}")
+        print(f"  LAST 5 TRADING SESSIONS SUMMARY")
+        print(f"{'='*60}")
+        for (d, n, w, l, pnl, src) in all_plan_results:
+            bar = ("+" * w + "-" * l) if n else "."
+            print(f"  {d}  {n:2d} trades  {w}W/{l}L  ${pnl:+7.0f}  {bar}")
+        print(f"  {'-'*50}")
+        print(f"  TOTAL         {len(recent_trades):2d} trades  "
+              f"{len(recent_wins)}W/{len(recent_losses)}L  ${recent_total:+.0f}")
+        if recent_trades:
+            print(f"  Win rate: {len(recent_wins)/len(recent_trades)*100:.1f}%")
+            print(f"  Avg/trade: ${recent_total/len(recent_trades):+.0f}")
+        print(f"{'='*60}")
+        sys.exit(0)
 
     # ── Older-date tests (5m proxy — 1m data unavailable beyond 7 days) ──────
     older_dates = sorted([d for d in PLANS if d < min(last5)])
