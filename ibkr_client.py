@@ -92,16 +92,19 @@ def _entry_order(action: str, quantity: int) -> Order:
 
 
 class TradingBot:
-    def __init__(self, symbols: list[str], plan: dict):
+    def __init__(self, symbols: list[str], plan: dict, ib=None):
         """
         symbols : list of tickers, e.g. ['TSLA', 'NVDA', 'AMD']
         plan    : {symbol: {'support': float|None, 'resistance': float|None}}
                   Missing symbols default to rules-only (no level filter).
+        ib      : optional IB-compatible instance.  Production passes None
+                  (real ib_insync.IB used).  Tests pass MockIB for
+                  deterministic scenario testing without TWS.
         """
         self.symbols = [s.upper() for s in symbols]
         self.plan    = plan          # Rip's levels for today's session
 
-        self.ib        = IB()
+        self.ib        = ib if ib is not None else IB()
         self.bars_10m: dict = {}     # symbol -> BarDataList  (trend direction)
         self.bars_3m:  dict = {}     # symbol -> BarDataList  (entry + management)
         self._sym_atr: dict = {}     # symbol -> 5-day avg daily range (for DTR exemption)
