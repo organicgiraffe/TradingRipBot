@@ -30,6 +30,14 @@ RATCHET_GIVEBACK     = 2.0    # max $ that can be given back once ratchet is act
                                # e.g. up $5 → stop floor = entry + $3 (locks $150 on runner)
                                #      up $7 → stop floor = entry + $5 (locks $250 on runner)
                                # tighter than $3 — works alongside the half-exit at level
+# ── ATR-scaled ratchet ──────────────────────────────────────────────────
+# Fixed $3/$2 are right for ~$150 stocks but absurd on $1000+ names (a $2
+# giveback on SNDK @ $1677 is 0.12% — inside the noise → instant stop-out).
+# When an ATR is supplied to compute_trailing_stop, the start/giveback become
+#   max(fixed, mult × ATR)  — so small stocks keep current behaviour and only
+# high-volatility names get the room they need.  ATR = 5-day avg daily range.
+ATR_START_MULT       = 0.40   # ratchet activates after 0.40 × ATR of profit
+ATR_GIVE_MULT        = 0.30   # lock stop within 0.30 × ATR of best price
 MAX_STOP_PCT         = 0.025  # skip trade if stop is farther than 2.5% of entry price
 MAX_STOP_DISTANCE    = 5.00   # legacy dollar cap — now secondary to MAX_STOP_PCT
 MAX_TRADES_PER_DAY   = 2      # up to 2 entries per symbol per day — allows re-entry on a fresh setup

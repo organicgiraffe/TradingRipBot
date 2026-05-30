@@ -13,7 +13,11 @@ sys.path.insert(0, ".")
 from config import (EMA_PERIODS, MIN_BARS_3M, MIN_BARS_10M,
                     MAX_TRADES_PER_DAY, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
                     MAX_RISK_PER_TRADE, MIN_SHARES, MIN_STOP_DIST,
-                    MAX_SIMULTANEOUS_POSITIONS)
+                    MAX_SIMULTANEOUS_POSITIONS,
+                    # Live-bot fixed-starter + pyramid sizing constants
+                    FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
+                    STARTER_RATIO, ADD_TRIGGER_PROFIT,
+                    MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH)
 from ema_engine import (get_trend_10m, get_entry_signal_3m,
                         should_exit_3m, compute_trailing_stop)
 
@@ -155,7 +159,7 @@ def run_today(symbol: str, shares: int = None,
         if no_new or trades_today >= MAX_TRADES_PER_DAY:
             continue
 
-        signal, stop_price = get_entry_signal_3m(
+        signal, stop_price, _reason = get_entry_signal_3m(
             df_3m_now, trend, bar_time=bar_time,
             pmh=pmh_today, pml=pml_today,
             support=rip_levels.get("support") if rip_levels else None,
@@ -192,7 +196,10 @@ def run_today(symbol: str, shares: int = None,
 # Multi-symbol runner — all symbols share position slots
 # ------------------------------------------------------------------ #
 
-def run_multi_today(setups: dict, date_str: str = None) -> list:
+def run_multi_today(setups: dict, date_str: str = None,
+                    interval: str = "5m", period: str = "60d",
+                    entry_freq: str = "5min", stale_secs: int = 600,
+                    sizing: str = "risk", atr_ratchet: bool = False) -> list:
     """
     Run all symbols in ONE interleaved time loop, enforcing
     MAX_SIMULTANEOUS_POSITIONS across all symbols.
@@ -200,17 +207,26 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
     setups: {symbol: rip_levels_dict}
       rip_levels_dict keys: 'support', 'resistance', 'bias', 'note'
 
+    interval/period: yfinance download params.  Default 5m/60d.  Pass
+      interval="1m", period="7d", entry_freq="3min" to mirror the LIVE bot's
+      3-minute entry timeframe (yfinance caps 1m history at ~8 days).
+    entry_freq:  pandas resample rule for the entry/management timeframe
+      ("5min" default, "3min" to match live).  The 10-min trend frame is
+      always resampled to "10min" regardless.
+    stale_secs:  max age of a symbol's latest bar before its entry is skipped.
+
     Returns list of all completed trades across all symbols.
     """
     print(f"\n{'='*65}")
     print(f"  MULTI-SYMBOL  |  {len(setups)} setups  "
-          f"|  max {MAX_SIMULTANEOUS_POSITIONS} simultaneous positions")
+          f"|  max {MAX_SIMULTANEOUS_POSITIONS} simultaneous positions"
+          f"  |  {interval} -> {entry_freq} entry frame")
     print(f"{'='*65}")
 
     # ── Download & prepare data for each symbol ───────────────────────────
     sym_data = {}
     for sym in setups:
-        raw = yf.download(sym, period="60d", interval="5m",
+        raw = yf.download(sym, period=period, interval=interval,
                           progress=False, auto_adjust=True, prepost=True)
         if raw.empty:
             print(f"  {sym}: no data — skipped")
@@ -227,14 +243,21 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
                 pml_by[_dt] = float(_grp["Low"].min())
 
         raw_rth = raw.between_time("09:30", "16:00")
-        df_5m   = _resample(raw_rth, "5min")
+        df_5m   = _resample(raw_rth, entry_freq)   # entry/management frame
         df_10m  = _resample(raw_rth, "10min")
+
+        # 5-day avg daily range (ATR proxy) — same definition the live bot uses
+        # in subscribe_bars.  Feeds the ATR-scaled ratchet.
+        _daily = raw_rth.groupby(raw_rth.index.date).agg(
+            {"High": "max", "Low": "min"})
+        _ranges = (_daily["High"] - _daily["Low"]).dropna()
+        sym_atr = float(_ranges.tail(5).mean()) if len(_ranges) else 0.0
 
         sym_data[sym] = {
             "df_5m": df_5m, "df_10m": df_10m,
-            "pmh_by": pmh_by, "pml_by": pml_by,
+            "pmh_by": pmh_by, "pml_by": pml_by, "atr": sym_atr,
         }
-        print(f"  {sym:6s} loaded  {len(df_5m)} bars")
+        print(f"  {sym:6s} loaded  {len(df_5m)} bars  ATR=${sym_atr:.2f}")
 
     if not sym_data:
         print("  No data for any symbol.")
@@ -286,6 +309,30 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
             if df3_now.empty:
                 continue
             cur = df3_now.iloc[-1]
+
+            # ---- Pyramid add-in (live sizing) ----------------------------
+            # When the starter shows ADD_TRIGGER_PROFIT ($3/sh) of favorable
+            # excursion, the live bot adds the remaining shares at market.
+            # Model the add filling at the trigger level (entry ± $3) and
+            # blend the entry, exactly like ibkr_client._on_add_fill.
+            if (not pos.get("add_triggered") and pos.get("shares_add", 0) > 0):
+                if pos["dir"] == "long":
+                    _reached = cur["high"] >= pos["entry"] + ADD_TRIGGER_PROFIT
+                    _add_px  = pos["entry"] + ADD_TRIGGER_PROFIT
+                else:
+                    _reached = cur["low"] <= pos["entry"] - ADD_TRIGGER_PROFIT
+                    _add_px  = pos["entry"] - ADD_TRIGGER_PROFIT
+                if _reached:
+                    _ash     = pos["shares_add"]
+                    _total   = pos["shares"] + _ash
+                    pos["entry"]         = (pos["entry"] * pos["shares"]
+                                            + _add_px * _ash) / _total
+                    pos["shares"]        = _total
+                    pos["add_triggered"] = True
+                    print(f"     ADD   {sym:6s} {pos['dir'].upper():<5} "
+                          f"{bar_time.strftime('%H:%M')}  +{_ash}sh @${_add_px:.2f}  "
+                          f"avg=${pos['entry']:.2f}  total={_total}sh")
+
             sh  = pos["shares"]
 
             if is_eod:
@@ -298,8 +345,15 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
                 del positions[sym]
                 continue
 
+            # Update running high-water-mark of per-share profit (HWM never
+            # decreases), exactly like the live bot's best_unrealised.
+            _bar_bu = (cur["high"] - pos["entry"] if pos["dir"] == "long"
+                       else pos["entry"] - cur["low"])
+            pos["best_unrealised"] = max(pos["best_unrealised"], _bar_bu)
             new_stop = compute_trailing_stop(
-                df3_now, pos["dir"], pos["stop"], pos["entry"])
+                df3_now, pos["dir"], pos["stop"], pos["entry"],
+                best_unrealised=pos["best_unrealised"],
+                atr=(sym_data[sym]["atr"] if atr_ratchet else 0.0))
             pos["stop"] = new_stop
 
             if pos["dir"] == "long" and cur["low"] <= pos["stop"]:
@@ -349,8 +403,8 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
             if len(df3_now) < MIN_BARS_3M:
                 continue
             cur = df3_now.iloc[-1]
-            # Skip if this symbol's latest bar is stale (> one 5-min period old)
-            if (bar_time - df3_now.index[-1]).total_seconds() > 600:
+            # Skip if this symbol's latest bar is stale (> stale_secs old)
+            if (bar_time - df3_now.index[-1]).total_seconds() > stale_secs:
                 continue
 
             df10     = sym_data[sym]["df_10m"]
@@ -363,7 +417,7 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
             pml   = sym_data[sym]["pml_by"].get(target)
             lvl   = rip_levels or {}
 
-            signal, stop_price = get_entry_signal_3m(
+            signal, stop_price, _reason = get_entry_signal_3m(
                 df3_now, trend, bar_time=bar_time,
                 pmh=pmh, pml=pml,
                 support=lvl.get("support"),
@@ -377,20 +431,41 @@ def run_multi_today(setups: dict, date_str: str = None) -> list:
             if stop_dist < MIN_STOP_DIST:
                 continue
 
-            n_shares = max(MIN_SHARES, int(MAX_RISK_PER_TRADE / stop_dist))
-            risk     = stop_dist * n_shares
+            if sizing == "live":
+                # LIVE BOT sizing: fixed full size (50 if >=$500 else 100),
+                # enter STARTER_RATIO now, add the rest on +$3/sh confirmation.
+                # Risk check uses STARTER shares only (matches ibkr_client).
+                n_full   = (FIXED_SHARES_HIGH if entry_price >= HIGH_PRICE_THRESHOLD
+                            else FIXED_SHARES)
+                n_shares = max(1, int(n_full * STARTER_RATIO))   # starter
+                n_add    = n_full - n_shares
+                risk     = stop_dist * n_shares
+                risk_cap = (MAX_RISK_DOLLARS_HIGH if entry_price >= HIGH_PRICE_THRESHOLD
+                            else MAX_RISK_DOLLARS)
+                if risk > risk_cap:
+                    continue   # live bot SKIPs when starter risk exceeds cap
+            else:
+                # Risk-based sizing (original behaviour)
+                n_shares = max(MIN_SHARES, int(MAX_RISK_PER_TRADE / stop_dist))
+                n_add    = 0
+                risk     = stop_dist * n_shares
             slot     = len(positions) + 1
 
             print(f"  >> ENTRY  {signal.upper():<5} {sym:6s} "
                   f"{bar_time.strftime('%H:%M')}  "
                   f"@ ${entry_price:.2f}  stop=${stop_price:.2f}  "
-                  f"shares={n_shares}  risk=${risk:.2f}  "
+                  f"shares={n_shares}+{n_add}add  risk=${risk:.2f}  "
                   f"[{slot}/{MAX_SIMULTANEOUS_POSITIONS}]  trend={trend}")
 
             positions[sym] = {
                 "symbol": sym, "dir": signal,
                 "entry": entry_price, "stop": stop_price,
                 "shares": n_shares, "entry_time": bar_time, "risk": risk,
+                # pyramid state (live sizing only; n_add=0 disables it)
+                "shares_add": n_add, "add_triggered": False,
+                # running high-water-mark per-share profit (drives the ratchet,
+                # matching how the live bot tracks best_unrealised)
+                "best_unrealised": 0.0,
             }
 
     # ── Summary ────────────────────────────────────────────────────────────

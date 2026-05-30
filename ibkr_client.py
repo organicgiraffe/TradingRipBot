@@ -150,6 +150,20 @@ class TradingBot:
         # the symbol stays in this set so RT loop never re-fires.
         self._exit_in_progress: set = set()
 
+        # In-flight EMERGENCY_FLATTEN / FILL_DRIFT orders awaiting confirmation.
+        # CRITICAL: the flatten order is PLACED inside the _on_fill callback
+        # (placeOrder is non-blocking, safe in a callback) but the confirm-or-
+        # adopt decision is deferred to the MAIN LOOP.  The old code polled
+        # with self.ib.sleep(0.1) INSIDE the fill callback — that re-enters
+        # the ib_insync event loop and pumps nested events (other fills, bar
+        # updates) mid-callback, which corrupts state.  This is the reentrancy
+        # footgun the bot's own design comment warns about, and a root cause
+        # of the 5/29 orphan trades.  Now the callback just queues here and
+        # returns; _process_pending_flattens() runs in the safe main-loop
+        # context where ib.sleep is legal.
+        #   symbol -> {trade, deadline, info, actual_px, dir, kind, orig_order_id}
+        self._pending_flattens: dict = {}
+
         # Last TWS reconciliation timestamp — runs every 30s in the main loop
         # to detect orphan positions (in TWS but not in self.positions) and
         # ghost positions (in self.positions but not in TWS).  Belt-and-
@@ -196,6 +210,79 @@ class TradingBot:
                     pass
         self.ib.disconnect()
         log.info("Disconnected from IBKR TWS")
+
+    def _resubscribe_after_reconnect(self):
+        """Re-establish ALL streaming subscriptions after a TWS reconnect.
+
+        A reconnect via ib.connect() restores the socket but does NOT restore
+        the market-data tickers or the keepUpToDate bar streams created before
+        the disconnect — those objects are dead.  Without this, the bot reports
+        'Reconnected' and looks healthy but is BLIND: _rt_price returns None,
+        bars stop updating, and RT stops / ratchet / EOD never fire.  Any open
+        position is then effectively unmanaged (only the TWS-side crash STP
+        protects it).  This re-subscribes everything so management resumes.
+        """
+        log.warning("  RECONNECT: re-subscribing market data + bar streams ...")
+        # Allow the per-symbol auto-recovery path to fire again post-reconnect.
+        if hasattr(self, "_resub_attempted"):
+            self._resub_attempted = set()
+
+        for symbol in list(self.symbols):
+            try:
+                contract = Stock(symbol, "SMART", "USD")
+                self.ib.qualifyContracts(contract)
+
+                # Market-data ticker (drives _rt_price)
+                try:
+                    self.ib.cancelMktData(contract)
+                except Exception:
+                    pass
+                self.ib.sleep(0.3)
+                ticker = self.ib.reqMktData(contract, '', False, False)
+                self.tickers[symbol] = ticker
+
+                # keepUpToDate bar streams (drive bar-based exits)
+                b10 = self.ib.reqHistoricalData(
+                    contract, endDateTime="", durationStr="20 D",
+                    barSizeSetting=BAR_SIZE_10M, whatToShow="TRADES",
+                    useRTH=False, keepUpToDate=True,
+                )
+                b3 = self.ib.reqHistoricalData(
+                    contract, endDateTime="", durationStr="3 D",
+                    barSizeSetting=BAR_SIZE_3M, whatToShow="TRADES",
+                    useRTH=False, keepUpToDate=True,
+                )
+                if b10:
+                    self.bars_10m[symbol] = b10
+                if b3:
+                    self.bars_3m[symbol] = b3
+
+                # Re-wire the lightweight update callbacks (queue-only).
+                def _on_3m_update(bars, hasNewBar, sym=symbol):
+                    if hasNewBar:
+                        self._3m_update_set.add(sym)
+
+                def _on_10m_update(bars, hasNewBar, sym=symbol):
+                    if hasNewBar:
+                        self._10m_update_set.add(sym)
+
+                if b3:
+                    b3.updateEvent  += _on_3m_update
+                if b10:
+                    b10.updateEvent += _on_10m_update
+
+                log.info(f"  RECONNECT: {symbol} re-subscribed "
+                         f"({len(b10)} x10m, {len(b3)} x3m)")
+            except Exception as _e:
+                log.error(f"  RECONNECT: {symbol} re-subscribe FAILED — {_e}.  "
+                          f"This symbol is blind until next reconnect; crash STP "
+                          f"still protects any open position.")
+
+        # Re-sync open orders / positions so _twss_stop_orders Trade objects and
+        # self.positions reflect post-reconnect TWS truth.  Reconciliation on the
+        # next 30s tick will flag/clean any divergence.
+        log.warning("  RECONNECT: re-subscribe complete — reconciliation will "
+                    "verify position state on next tick.")
 
     # ----------------------------------------------------------------------
     # Bar subscriptions
@@ -779,9 +866,12 @@ class TradingBot:
         # -----------------------------------------------------------------
         # ENTRY CHECKS
         # -----------------------------------------------------------------
-        # Count pending (order placed, awaiting fill) toward the slot limit
-        # so we don't fire a second entry while the first is still in-flight.
-        if len(self.positions) + len(self._pending_entries) >= MAX_SIMULTANEOUS_POSITIONS:
+        # Count pending (order placed, awaiting fill) AND in-flight flattens
+        # toward the slot limit, so we don't fire a second entry while the
+        # first is still in-flight or while an EMERGENCY_FLATTEN/FILL_DRIFT is
+        # still resolving (it may yet ADOPT into a managed position).
+        if (len(self.positions) + len(self._pending_entries)
+                + len(self._pending_flattens)) >= MAX_SIMULTANEOUS_POSITIONS:
             return
         if self._trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return
@@ -988,7 +1078,8 @@ class TradingBot:
         # the fill callback (in _open_position) ONLY after TWS confirms the fill.
         # This way cancelled orders (Error 354, etc.) never write a misleading
         # "ENTRY" line into the trades log.
-        slot = len(self.positions) + len(self._pending_entries) + 1
+        slot = (len(self.positions) + len(self._pending_entries)
+                + len(self._pending_flattens) + 1)
         log.info(
             f"  SIGNAL: {signal.upper():<5} {symbol}  "
             f"x{n}sh+{n_add}add  "
@@ -1107,71 +1198,16 @@ class TradingBot:
                     f"x{info['shares']}sh  @${actual_px:.2f}  stop=${_stop:.2f}  "
                     f"reason=inverted_stop  signal={info['entry_reason']}"
                 )
-                # ── VERIFY THE FLATTEN ACTUALLY FILLED ─────────────────────
-                # Fire-and-forget left orphan SHORT MU 25sh in TWS on 5/29
-                # (~$100+ unmanaged loss).  Now we store the Trade, poll
-                # orderStatus.status, and if it doesn't fill within 3s we
-                # ADOPT the original fill as a managed Position with a tight
-                # safe stop — better than leaving an unmanaged position.
-                try:
-                    _flat_trade = self.ib.placeOrder(
-                        info["contract"], _entry_order(_opposite, info["shares"]))
-                except Exception as _flat_e:
-                    log.error(f"  EMERGENCY_FLATTEN order failed: {_flat_e}  "
-                              f"— ADOPTING original fill for safe management")
-                    _flat_trade = None
-
-                _flat_confirmed = False
-                _flat_status    = "?"
-                if _flat_trade is not None:
-                    for _i in range(30):   # up to 3 seconds
-                        self.ib.sleep(0.1)
-                        _flat_status = _flat_trade.orderStatus.status
-                        if _flat_status == "Filled":
-                            _flat_confirmed = True
-                            break
-                        if _flat_status in ("Cancelled", "Inactive", "ApiCancelled"):
-                            # Flatten was rejected — must adopt
-                            break
-
-                if _flat_confirmed:
-                    log.info(f"  EMERGENCY_FLATTEN confirmed: {symbol} "
-                             f"closed via opposite MKT (status={_flat_status})")
-                    return   # Clean exit, no Position created
-
-                # ── ADOPT: flatten didn't confirm → manage the orphan ──────
-                # Compute a SAFE stop on the correct side of price: 0.5% off
-                # current fill.  Tight enough to cap downside, wide enough
-                # to not stop out on spread noise while operator reviews.
-                _safe_stop = (round(actual_px * 1.005, 2) if _dir == "short"
-                              else round(actual_px * 0.995, 2))
-                log.error(
-                    f"  EMERGENCY_FLATTEN UNCONFIRMED: {symbol} flatten order "
-                    f"status={_flat_status} after 3s.  ADOPTING original fill "
-                    f"with safe stop ${_safe_stop:.2f} — review in TWS."
-                )
-                tlog.info(
-                    f"ADOPTED  {_dir.upper():<5}  {symbol}  x{info['shares']}sh  "
-                    f"@${actual_px:.2f}  safe_stop=${_safe_stop:.2f}  "
-                    f"reason=emergency_flatten_unconfirmed  signal={info['entry_reason']}"
-                )
-                pos = Position(
-                    symbol=symbol, direction=_dir, shares=info["shares"],
-                    entry_price=actual_px, entry_time=info["time"],
-                    stop_price=_safe_stop,
-                    ibkr_order_id=t.order.orderId,
-                    entry_signal=info["entry_reason"] + "_ADOPTED",
-                    level_res=info["level_res"], level_sup=info["level_sup"],
-                    shares_full=info["shares_full"], shares_add=0,  # no add on adopted
-                )
-                self.positions[symbol] = pos
-                self._place_crash_stop(symbol, info["contract"],
-                                       _dir, info["shares"], _safe_stop)
-                self._manual_intervention[symbol] = (
-                    f"adopted after EMERGENCY_FLATTEN unconfirmed "
-                    f"(flat_status={_flat_status}); review and close manually if needed"
-                )
-                return   # Adopted — bot will now manage it via normal exit logic
+                # Place the flatten order and DEFER the confirm/adopt decision
+                # to the main loop.  Do NOT poll with ib.sleep here — this is a
+                # fill callback and sleeping re-enters the event loop (reentrancy
+                # footgun, root cause of 5/29 orphans).  _queue_flatten just
+                # places the order (non-blocking) and records it; the main loop's
+                # _process_pending_flattens confirms or adopts on later ticks.
+                self._queue_flatten(symbol, info, actual_px, _dir,
+                                    kind="emergency_flatten",
+                                    orig_order_id=t.order.orderId)
+                return   # Decision deferred to main loop — no sleep in callback
 
             # ── Drift guard — if fill drifted > 1% from signal estimate,
             # something is wrong (stale paper data, fast move).  Abort
@@ -1191,62 +1227,12 @@ class TradingBot:
                         f"x{info['shares']}sh  signal=${_signal_px:.2f}->fill=${actual_px:.2f}  "
                         f"drift={_drift_pct*100:.2f}%  signal={info['entry_reason']}"
                     )
-                    # ── VERIFY THE FLATTEN (same pattern as EMERGENCY_FLATTEN) ──
-                    try:
-                        _flat_trade = self.ib.placeOrder(
-                            info["contract"], _entry_order(_opposite, info["shares"]))
-                    except Exception as _flat_e:
-                        log.error(f"  FILL_DRIFT flatten failed: {_flat_e}  "
-                                  f"— ADOPTING original fill for safe management")
-                        _flat_trade = None
-
-                    _flat_confirmed = False
-                    _flat_status    = "?"
-                    if _flat_trade is not None:
-                        for _i in range(30):
-                            self.ib.sleep(0.1)
-                            _flat_status = _flat_trade.orderStatus.status
-                            if _flat_status == "Filled":
-                                _flat_confirmed = True
-                                break
-                            if _flat_status in ("Cancelled", "Inactive", "ApiCancelled"):
-                                break
-
-                    if _flat_confirmed:
-                        log.info(f"  FILL_DRIFT confirmed: {symbol} "
-                                 f"closed via opposite MKT (status={_flat_status})")
-                        return
-
-                    # ── ADOPT: drift-flatten unconfirmed → manage the orphan ──
-                    _safe_stop = (round(actual_px * 1.005, 2) if _dir == "short"
-                                  else round(actual_px * 0.995, 2))
-                    log.error(
-                        f"  FILL_DRIFT UNCONFIRMED: {symbol} flatten order "
-                        f"status={_flat_status} after 3s.  ADOPTING original fill "
-                        f"with safe stop ${_safe_stop:.2f} — review in TWS."
-                    )
-                    tlog.info(
-                        f"ADOPTED  {_dir.upper():<5}  {symbol}  x{info['shares']}sh  "
-                        f"@${actual_px:.2f}  safe_stop=${_safe_stop:.2f}  "
-                        f"reason=fill_drift_unconfirmed  signal={info['entry_reason']}"
-                    )
-                    pos = Position(
-                        symbol=symbol, direction=_dir, shares=info["shares"],
-                        entry_price=actual_px, entry_time=info["time"],
-                        stop_price=_safe_stop,
-                        ibkr_order_id=t.order.orderId,
-                        entry_signal=info["entry_reason"] + "_ADOPTED",
-                        level_res=info["level_res"], level_sup=info["level_sup"],
-                        shares_full=info["shares_full"], shares_add=0,
-                    )
-                    self.positions[symbol] = pos
-                    self._place_crash_stop(symbol, info["contract"],
-                                           _dir, info["shares"], _safe_stop)
-                    self._manual_intervention[symbol] = (
-                        f"adopted after FILL_DRIFT unconfirmed "
-                        f"(flat_status={_flat_status}); review and close manually if needed"
-                    )
-                    return
+                    # Place flatten, defer confirm/adopt to main loop (no sleep
+                    # in callback — same reentrancy fix as EMERGENCY_FLATTEN).
+                    self._queue_flatten(symbol, info, actual_px, _dir,
+                                        kind="fill_drift",
+                                        orig_order_id=t.order.orderId)
+                    return   # Decision deferred to main loop — no sleep in callback
 
             pos = Position(
                 symbol=symbol,
@@ -1534,6 +1520,103 @@ class TradingBot:
 
         del self.positions[symbol]
         self._exit_in_progress.discard(symbol)   # close complete, RT can re-engage
+
+    # ----------------------------------------------------------------------
+    # Deferred flatten handling — EMERGENCY_FLATTEN / FILL_DRIFT
+    # ----------------------------------------------------------------------
+
+    def _queue_flatten(self, symbol: str, info: dict, actual_px: float,
+                       direction: str, kind: str, orig_order_id: int):
+        """Place an opposite-side MKT to flatten an inverted/drifted fill, then
+        record it for deferred confirmation in the main loop.
+
+        CRITICAL: this is called from inside the _on_fill event callback.
+        placeOrder() is non-blocking and safe in a callback, but we must NOT
+        poll for the result with ib.sleep() here — that re-enters the event
+        loop and pumps nested events (the 5/29 reentrancy bug).  The confirm-
+        or-adopt decision happens in _process_pending_flattens() which runs in
+        the main loop where ib.sleep is legal.
+        """
+        _opposite = "SELL" if direction == "long" else "BUY"
+        _flat_trade = None
+        try:
+            _flat_trade = self.ib.placeOrder(
+                info["contract"], _entry_order(_opposite, info["shares"]))
+            log.info(f"  {kind.upper()}: flatten {_opposite} {info['shares']}sh "
+                     f"{symbol} placed (order #{_flat_trade.order.orderId}) — "
+                     f"awaiting confirmation in main loop")
+        except Exception as _flat_e:
+            log.error(f"  {kind.upper()} flatten placeOrder failed: {_flat_e}  "
+                      f"— will ADOPT on next main-loop tick")
+
+        self._pending_flattens[symbol] = {
+            "trade":          _flat_trade,
+            "deadline":       datetime.now() + timedelta(seconds=3),
+            "info":           info,
+            "actual_px":      actual_px,
+            "dir":            direction,
+            "kind":           kind,
+            "orig_order_id":  orig_order_id,
+        }
+
+    def _process_pending_flattens(self, now: datetime):
+        """Main-loop processor for in-flight EMERGENCY_FLATTEN / FILL_DRIFT
+        orders.  For each pending flatten:
+          * status == Filled  → flatten confirmed, drop it (clean exit).
+          * rejected / deadline passed / order never placed → ADOPT the
+            original fill as a managed Position with a tight safe stop, place
+            a crash STP, and flag manual_intervention for operator review.
+        Runs in the safe main-loop context (ib.sleep is legal here, though we
+        don't even need it — we just read orderStatus once per tick).
+        """
+        for symbol, pf in list(self._pending_flattens.items()):
+            _trade  = pf["trade"]
+            _status = _trade.orderStatus.status if _trade is not None else "?"
+
+            if _status == "Filled":
+                log.info(f"  {pf['kind'].upper()} confirmed: {symbol} closed "
+                         f"via opposite MKT (status=Filled)")
+                self._pending_flattens.pop(symbol, None)
+                continue
+
+            _rejected = _status in ("Cancelled", "Inactive", "ApiCancelled")
+            _expired  = now >= pf["deadline"]
+            if not (_rejected or _expired or _trade is None):
+                continue   # still working, within deadline — wait
+
+            # ── ADOPT ──────────────────────────────────────────────────────
+            info      = pf["info"]
+            _dir      = pf["dir"]
+            actual_px = pf["actual_px"]
+            _safe_stop = (round(actual_px * 1.005, 2) if _dir == "short"
+                          else round(actual_px * 0.995, 2))
+            log.error(
+                f"  {pf['kind'].upper()} UNCONFIRMED: {symbol} flatten status="
+                f"{_status}.  ADOPTING original fill with safe stop "
+                f"${_safe_stop:.2f} — review in TWS."
+            )
+            tlog.info(
+                f"ADOPTED  {_dir.upper():<5}  {symbol}  x{info['shares']}sh  "
+                f"@${actual_px:.2f}  safe_stop=${_safe_stop:.2f}  "
+                f"reason={pf['kind']}_unconfirmed  signal={info['entry_reason']}"
+            )
+            pos = Position(
+                symbol=symbol, direction=_dir, shares=info["shares"],
+                entry_price=actual_px, entry_time=info["time"],
+                stop_price=_safe_stop,
+                ibkr_order_id=pf["orig_order_id"],
+                entry_signal=info["entry_reason"] + "_ADOPTED",
+                level_res=info["level_res"], level_sup=info["level_sup"],
+                shares_full=info["shares_full"], shares_add=0,  # no add on adopted
+            )
+            self.positions[symbol] = pos
+            self._place_crash_stop(symbol, info["contract"],
+                                   _dir, info["shares"], _safe_stop)
+            self._manual_intervention[symbol] = (
+                f"adopted after {pf['kind']} unconfirmed (flat_status={_status}); "
+                f"review and close manually if needed"
+            )
+            self._pending_flattens.pop(symbol, None)
 
     # ----------------------------------------------------------------------
     # TWS reconciliation — detect orphans (TWS has, bot doesn't) and
@@ -1878,9 +1961,26 @@ class TradingBot:
                 log.warning(f"TWS disconnected — reconnect attempt {_reconnect_attempts}/3 ...")
                 try:
                     self.ib.sleep(5)
+                    # Fully tear down the old socket first.  Reconnecting with
+                    # the same clientId while the stale session lingers on TWS's
+                    # side triggers 'clientId already in use' rejections; an
+                    # explicit disconnect avoids that.
+                    try:
+                        self.ib.disconnect()
+                    except Exception:
+                        pass
+                    self.ib.sleep(1)
                     self.ib.connect(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID)
                     log.info("Reconnected to TWS")
                     _reconnect_attempts = 0
+                    # CRITICAL: a bare reconnect leaves the bot blind — the old
+                    # tickers and bar streams are dead.  Re-subscribe everything
+                    # so RT stops / ratchet / EOD resume managing open positions.
+                    self._resubscribe_after_reconnect()
+                    # Force an immediate reconciliation so any position that
+                    # changed during the outage (STP fired, etc.) is caught now
+                    # rather than waiting up to 30s.
+                    self._last_reconcile_dt = None
                 except Exception as _conn_e:
                     log.warning(f"Reconnect failed: {_conn_e}")
                 continue
@@ -1905,6 +2005,13 @@ class TradingBot:
                     log.warning(f"hot_add.json error: {_e}")
                 finally:
                     _hot_path.unlink(missing_ok=True)
+
+            # -- Deferred flatten processing (every tick) ------------------
+            # EMERGENCY_FLATTEN / FILL_DRIFT place their flatten order inside
+            # the fill callback but defer the confirm/adopt decision here, in
+            # the safe main-loop context (no reentrant ib.sleep in callbacks).
+            if self._pending_flattens:
+                self._process_pending_flattens(now)
 
             # -- TWS reconciliation (every 30 seconds) ---------------------
             # Compares self.positions to self.ib.positions() to catch any
