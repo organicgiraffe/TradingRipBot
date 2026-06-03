@@ -22,6 +22,7 @@ MIN_BARS_3M  = 60      # 50 EMA stable enough for 3-min entry
 # Bar sizes
 BAR_SIZE_10M = "10 mins"   # trend direction
 BAR_SIZE_3M  = "3 mins"    # entry + trade management
+BAR_SIZE_5M  = "5 mins"    # ORB breakout detection (the tested ORB timeframe)
 
 # Quality trade filters
 BREAKEVEN_TRIGGER    = 5.0    # once trade is $5 profitable, lock stop at entry (legacy, kept for ref)
@@ -98,6 +99,21 @@ MAX_RISK_DOLLARS_HIGH = 900   # separate cap for stocks >= HIGH_PRICE_THRESHOLD 
                                # MU $886 entry, stop $872 → $14.65 × 50sh = $732 → allowed
                                # prevents blocking big movers just because their $ stop is wide
 MAX_SIMULTANEOUS_POSITIONS = 2   # allow 2 concurrent trades — second slot catches HOOD/ZS while MU/SNDK runs
+
+# ── Opening-Range Breakout (ORB) entry ────────────────────────────────────
+# Experimental.  Exact ORB tests must build the opening range from 1-minute
+# 09:30-09:40 data; the old 60-day Yahoo 5-minute ORB numbers were only a
+# coarse approximation and should not be treated as validated live results.
+# Default OFF until paper-validated on real-time data.  When ON, the live bot
+# uses a software stop trigger off live last/mid price and reuses _open_position
+# so crash-stop / fill-callback / EMERGENCY_FLATTEN safety all apply.
+ORB_ENABLED   = False              # master switch
+ORB_MINUTES   = 10                 # opening range = 09:30:00 .. 09:30+ORB_MINUTES (exact)
+ORB_STOP_MODE = "third_from_break" # "third_from_break" | "midpoint" | "full_range"
+ORB_FULL_SIZE = True               # enter full size at the break (no pyramid add)
+ORB_ENTRY_PAD = 0.01               # stop-style trigger offset: long = OR_high+pad,
+                                   # short = OR_low-pad.  Entry/risk uses the TRIGGER
+                                   # price, NOT the breakout candle's close.
 
 # Level proximity — entry must be NEAR Rip's level, not chasing mid-range
 # Long:  entry must be below resistance + 1.5%  (at support or fresh breakout only)

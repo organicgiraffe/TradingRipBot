@@ -13,12 +13,13 @@ sys.path.insert(0, ".")
 from config import (EMA_PERIODS, MIN_BARS_3M, MIN_BARS_10M,
                     MAX_TRADES_PER_DAY, MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE,
                     MAX_RISK_PER_TRADE, MIN_SHARES, MIN_STOP_DIST,
-                    MAX_SIMULTANEOUS_POSITIONS,
+                    MAX_SIMULTANEOUS_POSITIONS, MAX_STOP_PCT,
                     # Live-bot fixed-starter + pyramid sizing constants
                     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
                     STARTER_RATIO, ADD_TRIGGER_PROFIT,
                     MAX_RISK_DOLLARS, MAX_RISK_DOLLARS_HIGH)
 from ema_engine import (get_trend_10m, get_entry_signal_3m,
+                        get_gap_signal_3m, get_open_cloud_break_signal_3m,
                         should_exit_3m, compute_trailing_stop)
 
 
@@ -193,13 +194,99 @@ def run_today(symbol: str, shares: int = None,
 
 
 # ------------------------------------------------------------------ #
+# Reusable data prep — download once, reuse across many days
+# ------------------------------------------------------------------ #
+
+def prepare_sym_data(symbols, interval="1m", period="7d",
+                     entry_freq="3min", quiet=False) -> dict:
+    """Download + resample each symbol once.  Returns
+    {sym: {df_5m, df_10m, pmh_by, pml_by, atr}}.  EMAs are computed on
+    premarket-inclusive bars (matches the live bot's useRTH=False)."""
+    sym_data = {}
+    for sym in symbols:
+        raw = yf.download(sym, period=period, interval=interval,
+                          progress=False, auto_adjust=True, prepost=True)
+        if raw.empty:
+            if not quiet: print(f"  {sym}: no data — skipped")
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        raw = raw.tz_convert("US/Eastern")
+
+        _pre = raw.between_time("04:00", "09:29")
+        pmh_by = {}; pml_by = {}
+        for _dt, _grp in _pre.groupby(_pre.index.date):
+            if not _grp.empty:
+                pmh_by[_dt] = float(_grp["High"].max())
+                pml_by[_dt] = float(_grp["Low"].min())
+
+        raw_rth  = raw.between_time("09:30", "16:00")
+        raw_cont = raw.between_time("04:00", "20:00")   # pre + RTH + post
+        df_5m  = _resample(raw_cont, entry_freq)
+        df_10m = _resample(raw_cont, "10min")
+        # Raw-granularity RTH frame (1-min when interval="1m") — the ONLY source
+        # for the exact 09:30-09:40 opening range used by ORB.  Never derive the
+        # OR from the coarse entry-frame (df_5m) bars.
+        df_1m  = raw_rth.rename(columns=str.lower)
+
+        _daily  = raw_rth.groupby(raw_rth.index.date).agg({"High": "max", "Low": "min"})
+        _ranges = (_daily["High"] - _daily["Low"]).dropna()
+        sym_atr = float(_ranges.tail(5).mean()) if len(_ranges) else 0.0
+
+        sym_data[sym] = {"df_5m": df_5m, "df_10m": df_10m, "df_1m": df_1m,
+                         "pmh_by": pmh_by, "pml_by": pml_by, "atr": sym_atr}
+        if not quiet:
+            print(f"  {sym:6s} loaded  {len(df_5m)} bars  ATR=${sym_atr:.2f}")
+    return sym_data
+
+
+def _has_one_minute_or_data(df: pd.DataFrame) -> bool:
+    """True when df has raw 1-min-ish intraday rows, not coarse 5-min rows."""
+    if df is None or df.empty or len(df.index) < 2:
+        return False
+    diffs = pd.Series(df.index).diff().dropna()
+    diffs = diffs[(diffs > pd.Timedelta(0)) & (diffs <= pd.Timedelta("5min"))]
+    if diffs.empty:
+        return False
+    return diffs.median() <= pd.Timedelta("75s")
+
+
+def _validate_orb_source_data(sym_data: dict):
+    bad = []
+    for sym, sd in sym_data.items():
+        if not _has_one_minute_or_data(sd.get("df_1m")):
+            bad.append(sym)
+    if bad:
+        shown = ", ".join(bad[:8])
+        extra = "" if len(bad) <= 8 else f", ... +{len(bad) - 8} more"
+        raise ValueError(
+            "ORB backtest requires exact 1-minute RTH data in each symbol's "
+            f"df_1m. Coarse OR data found for: {shown}{extra}. "
+            "Use interval='1m'/period within Yahoo's 1m limit, or pass a "
+            "prefetched dict whose df_1m is truly 1-minute."
+        )
+
+
+# ------------------------------------------------------------------ #
 # Multi-symbol runner — all symbols share position slots
 # ------------------------------------------------------------------ #
 
 def run_multi_today(setups: dict, date_str: str = None,
                     interval: str = "5m", period: str = "60d",
                     entry_freq: str = "5min", stale_secs: int = 600,
-                    sizing: str = "risk", atr_ratchet: bool = False) -> list:
+                    sizing: str = "risk", atr_ratchet: bool = False,
+                    atr_stop_mult: float = 0.0,
+                    use_lost_dir: bool = True,
+                    wick_filter_thresh: float = 0.0,
+                    wick_lookback: int = 5,
+                    c3_filter: bool = False,
+                    first_entry_hhmm=None,
+                    ema200_filter: bool = False, ema200_buf: float = 0.002,
+                    doji_filter: bool = False, doji_thresh: float = 0.30,
+                    orb_entry: bool = False, orb_minutes: int = 10,
+                    orb_stop_mode: str = "third_from_break",
+                    orb_allow_3min: bool = False,
+                    prefetched: dict = None, quiet: bool = False) -> list:
     """
     Run all symbols in ONE interleaved time loop, enforcing
     MAX_SIMULTANEOUS_POSITIONS across all symbols.
@@ -217,51 +304,43 @@ def run_multi_today(setups: dict, date_str: str = None,
 
     Returns list of all completed trades across all symbols.
     """
-    print(f"\n{'='*65}")
-    print(f"  MULTI-SYMBOL  |  {len(setups)} setups  "
-          f"|  max {MAX_SIMULTANEOUS_POSITIONS} simultaneous positions"
-          f"  |  {interval} -> {entry_freq} entry frame")
-    print(f"{'='*65}")
+    # ORB was validated on 5-MINUTE entry bars.  Refuse to silently run it on a
+    # different timeframe — that would be an untested strategy.  Pass
+    # orb_allow_3min=True only to run a clearly-separate 3-min ORB experiment.
+    if orb_entry and entry_freq != "5min" and not orb_allow_3min:
+        raise ValueError(
+            f"ORB backtest requires entry_freq='5min' (the tested timeframe); "
+            f"got entry_freq={entry_freq!r}.  Pass orb_allow_3min=True to run a "
+            f"separate, explicitly-labelled 3-min ORB experiment."
+        )
+    if orb_entry and prefetched is None and interval != "1m":
+        raise ValueError(
+            "ORB backtest needs interval='1m' so the opening range is exact. "
+            f"Got interval={interval!r}; Yahoo 5m/60d data is only a coarse "
+            "approximation and is no longer accepted by default."
+        )
 
-    # ── Download & prepare data for each symbol ───────────────────────────
-    sym_data = {}
-    for sym in setups:
-        raw = yf.download(sym, period=period, interval=interval,
-                          progress=False, auto_adjust=True, prepost=True)
-        if raw.empty:
-            print(f"  {sym}: no data — skipped")
-            continue
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        raw = raw.tz_convert("US/Eastern")
+    if not quiet:
+        print(f"\n{'='*65}")
+        print(f"  MULTI-SYMBOL  |  {len(setups)} setups  "
+              f"|  max {MAX_SIMULTANEOUS_POSITIONS} simultaneous positions"
+              f"  |  {interval} -> {entry_freq} entry frame")
+        print(f"{'='*65}")
 
-        _pre = raw.between_time("04:00", "09:29")
-        pmh_by = {}; pml_by = {}
-        for _dt, _grp in _pre.groupby(_pre.index.date):
-            if not _grp.empty:
-                pmh_by[_dt] = float(_grp["High"].max())
-                pml_by[_dt] = float(_grp["Low"].min())
-
-        raw_rth = raw.between_time("09:30", "16:00")
-        df_5m   = _resample(raw_rth, entry_freq)   # entry/management frame
-        df_10m  = _resample(raw_rth, "10min")
-
-        # 5-day avg daily range (ATR proxy) — same definition the live bot uses
-        # in subscribe_bars.  Feeds the ATR-scaled ratchet.
-        _daily = raw_rth.groupby(raw_rth.index.date).agg(
-            {"High": "max", "Low": "min"})
-        _ranges = (_daily["High"] - _daily["Low"]).dropna()
-        sym_atr = float(_ranges.tail(5).mean()) if len(_ranges) else 0.0
-
-        sym_data[sym] = {
-            "df_5m": df_5m, "df_10m": df_10m,
-            "pmh_by": pmh_by, "pml_by": pml_by, "atr": sym_atr,
-        }
-        print(f"  {sym:6s} loaded  {len(df_5m)} bars  ATR=${sym_atr:.2f}")
+    # ── Data: use prefetched if given (fast multi-day runs), else download ──
+    if prefetched is not None:
+        sym_data = {s: prefetched[s] for s in setups if s in prefetched}
+    else:
+        sym_data = prepare_sym_data(list(setups.keys()), interval=interval,
+                                    period=period, entry_freq=entry_freq,
+                                    quiet=quiet)
 
     if not sym_data:
-        print("  No data for any symbol.")
+        if not quiet:
+            print("  No data for any symbol.")
         return []
+    if orb_entry:
+        _validate_orb_source_data(sym_data)
 
     # ── Determine target date ─────────────────────────────────────────────
     if date_str:
@@ -281,10 +360,15 @@ def run_multi_today(setups: dict, date_str: str = None,
             print(f"  {sym:6s}  PM H=${pmh:.2f}  L=${pml:.2f}{note}")
 
     # ── Merged timeline for target date ───────────────────────────────────
+    # EMA frames now include premarket/after-hours bars (for gap-correct EMA
+    # warmup), but we only TRADE during the regular session 09:30-16:00.
+    import datetime as _dt
+    _rth_start = _dt.time(9, 30)
+    _rth_end   = _dt.time(16, 0)
     all_times = sorted({
         t for sd in sym_data.values()
         for t in sd["df_5m"].index
-        if t.date() == target
+        if t.date() == target and _rth_start <= t.time() <= _rth_end
     })
 
     # ── Simulation state ──────────────────────────────────────────────────
@@ -292,6 +376,8 @@ def run_multi_today(setups: dict, date_str: str = None,
     all_trades     = []
     trades_today   = {sym: 0    for sym in sym_data}
     lost_dir_today = {sym: None for sym in sym_data}
+    # ORB state: store the opening range once it's established, one-shot per sym
+    _orb_ranges    = {}   # sym -> {"high": float, "low": float, "fired": bool}
 
     print()
 
@@ -388,6 +474,10 @@ def run_multi_today(setups: dict, date_str: str = None,
         if no_new or len(positions) >= MAX_SIMULTANEOUS_POSITIONS:
             continue
 
+        # Early-entry gate (test-only): skip the volatile open until this time.
+        if first_entry_hhmm is not None and bar_time.time() < first_entry_hhmm:
+            continue
+
         for sym, rip_levels in setups.items():
             if len(positions) >= MAX_SIMULTANEOUS_POSITIONS:
                 break
@@ -417,16 +507,174 @@ def run_multi_today(setups: dict, date_str: str = None,
             pml   = sym_data[sym]["pml_by"].get(target)
             lvl   = rip_levels or {}
 
-            signal, stop_price, _reason = get_entry_signal_3m(
-                df3_now, trend, bar_time=bar_time,
-                pmh=pmh, pml=pml,
-                support=lvl.get("support"),
-                resistance=lvl.get("resistance"),
-            )
-            if signal == "none" or signal == lost_dir_today[sym]:
+            # ── OPENING-RANGE BREAKOUT (test-only) ─────────────────────────
+            # STOP-STYLE breakout, NOT candle-close.  Mirrors production
+            # ibkr_client._try_orb_entry exactly:
+            #   * OR = the EXACT 09:30:00-09:40:00 range built from 1-min bars
+            #     (df_1m), never the coarse entry frame.
+            #   * Triggers: long = OR_high+0.01, short = OR_low-0.01.
+            #   * Entry/risk use the TRIGGER price (not cur.close).
+            #   * One shot per symbol per day; both-sides-in-one-bar is
+            #     ambiguous → skip WITHOUT consuming the shot.
+            #   * Full fixed size (ORB_FULL_SIZE), so it creates positions under
+            #     BOTH sizing="live" and sizing="risk".
+            if orb_entry:
+                import datetime as _dt2
+                _pad      = 0.01
+                _total    = 30 + orb_minutes
+                _or_end   = _dt2.time(9 + _total // 60, _total % 60)
+                _last_min = 30 + orb_minutes - 1
+                _last_t   = f"{9 + _last_min // 60:02d}:{_last_min % 60:02d}"
+                _orbr = _orb_ranges.setdefault(sym, {"high": None, "low": None, "fired": False})
+                if not _orbr["fired"] and bar_time.time() >= _or_end:
+                    # Build the exact OR from 1-min bars, once.
+                    if _orbr["high"] is None:
+                        _d1 = sym_data[sym].get("df_1m")
+                        if _d1 is not None:
+                            _d1t = _d1[_d1.index.date == target]
+                            _win = _d1t.between_time("09:30", _last_t) if len(_d1t) else _d1t
+                            if _win is not None and not _win.empty:
+                                _orbr["high"] = float(_win["high"].max())
+                                _orbr["low"]  = float(_win["low"].min())
+                    if _orbr["high"] is not None:
+                        _oh, _ol = _orbr["high"], _orbr["low"]
+                        _orng = _oh - _ol
+                        if _orng > 0:
+                            _long_trig  = round(_oh + _pad, 2)
+                            _short_trig = round(_ol - _pad, 2)
+                            _hl = cur["high"] >= _long_trig
+                            _hs = cur["low"]  <= _short_trig
+                            if _hl and _hs:
+                                pass                      # ambiguous → keep the shot
+                            elif _hl or _hs:
+                                _dir   = "long" if _hl else "short"
+                                _entry = _long_trig if _hl else _short_trig
+                                if orb_stop_mode == "third_from_break":
+                                    _stop = (round(_oh - _orng / 3, 2) if _hl
+                                             else round(_ol + _orng / 3, 2))
+                                elif orb_stop_mode == "midpoint":
+                                    _stop = round((_oh + _ol) / 2, 2)
+                                else:  # full_range
+                                    _stop = (round(_ol - _pad, 2) if _hl
+                                             else round(_oh + _pad, 2))
+                                _sd = abs(_entry - _stop)
+                                if _sd < MIN_STOP_DIST:
+                                    _orbr["fired"] = True          # degenerate → consume shot
+                                else:
+                                    _shf = (FIXED_SHARES_HIGH if _entry >= HIGH_PRICE_THRESHOLD
+                                            else FIXED_SHARES)
+                                    _cap = (MAX_RISK_DOLLARS_HIGH if _entry >= HIGH_PRICE_THRESHOLD
+                                            else MAX_RISK_DOLLARS)
+                                    if _shf * _sd > _cap:
+                                        _orbr["fired"] = True      # risk-capped → consume shot
+                                    else:
+                                        _orbr["fired"] = True
+                                        pos = {"dir": _dir, "entry": _entry, "stop": _stop,
+                                               "shares": _shf, "shares_add": 0,
+                                               "add_triggered": False, "sym": sym, "symbol": sym,
+                                               "best_unrealised": 0.0, "entry_signal": "orb_break",
+                                               "entry_time": bar_time, "exit_time": None, "pnl": 0.0}
+                                        positions[sym] = pos
+                                        trades_today[sym] += 1
+                                        print(f"  >> ENTRY  {_dir.upper():<5} {sym:6s} "
+                                              f"{bar_time.strftime('%H:%M')}  @ ${_entry:.2f} (trigger)  "
+                                              f"stop=${_stop:.2f}  ORB[{_ol:.2f}-{_oh:.2f}]  "
+                                              f"[orb_break]  [{len(positions)}/{MAX_SIMULTANEOUS_POSITIONS}]")
+                                        continue
+                # No clean ORB trigger this bar → fall through to cloud signals.
+
+            # FULL live-bot signal sequence (parity with ibkr_client._on_new_bar_3m):
+            #   1) opening-drive cloud break  (catches crash/gap-open flushes —
+            #      this is what was MISSING and caused the bot to "miss" ZS)
+            #   2) gap-and-go / gap-and-crap   (needs pmh / support / resistance)
+            #   3) core 5/12 cloud-flip + continuation signal
+            # The first non-"none" wins, exactly as live.
+            gap_signal, gap_stop, gap_reason = get_open_cloud_break_signal_3m(
+                df3_now, bar_time=bar_time)
+            if gap_signal == "none":
+                gap_signal, gap_stop, gap_reason = get_gap_signal_3m(
+                    df3_now, bar_time=bar_time, pmh=pmh,
+                    support=lvl.get("support"), resistance=lvl.get("resistance"))
+
+            if gap_signal != "none":
+                signal, stop_price, _reason = gap_signal, gap_stop, gap_reason
+            else:
+                signal, stop_price, _reason = get_entry_signal_3m(
+                    df3_now, trend, bar_time=bar_time,
+                    pmh=pmh, pml=pml,
+                    support=lvl.get("support"),
+                    resistance=lvl.get("resistance"),
+                )
+            # lost_dir lockout — toggleable for testing.  A pure cloud-follower
+            # arguably should NOT block a direction after one stop (it prevents
+            # re-following the cloud when it re-confirms — cost the META $29 run).
+            if signal == "none":
+                continue
+            if use_lost_dir and signal == lost_dir_today[sym]:
                 continue
 
+            # C3 ALIGNMENT FILTER (test-only) — "don't trade against the 34/50".
+            # Long only when the 34/50 cloud is green (ema34>ema50); short only
+            # when it's red.  Blocks counter-trend 5/12 flips like the ARM/ZS
+            # green-cloud shorts.  c3_filter=False keeps the no-filter behavior.
+            if c3_filter:
+                _c = df3_now.iloc[-1]
+                _c3_green = _c["ema34"] > _c["ema50"]
+                if signal == "long" and not _c3_green:
+                    continue
+                if signal == "short" and _c3_green:
+                    continue
+
+            # 200-EMA S/R FILTER (test-only) — don't short INTO the 200 (support
+            # below) or long INTO it (resistance above).  ARM 06-01 shorted right
+            # on the 200 EMA at the V-bottom → -$641.
+            if ema200_filter:
+                _c = df3_now.iloc[-1]; _e2 = _c["ema200"]; _px = _c["close"]
+                if _e2 > 0:
+                    if signal == "short" and _px >= _e2 and (_px - _e2)/_e2 < ema200_buf:
+                        continue   # shorting into 200-EMA support
+                    if signal == "long" and _px <= _e2 and (_e2 - _px)/_e2 < ema200_buf:
+                        continue   # longing into 200-EMA resistance
+
+            # DOJI / CANDLE-QUALITY FILTER (test-only) — skip indecision candles.
+            # Require the trigger bar's body >= doji_thresh of its range.  ARM
+            # 06-01 shorted a doji that marked the bottom.
+            if doji_filter:
+                _c = df3_now.iloc[-1]
+                _body = abs(_c["close"] - _c["open"]); _rng = _c["high"] - _c["low"]
+                if _rng > 0 and _body / _rng < doji_thresh:
+                    continue   # doji / weak body → no conviction, skip
+
+            # IDEA 1 — WICK STAND-ASIDE FILTER (test-only).
+            # Wicks = rejection.  When the last `wick_lookback` 3-min candles
+            # are mostly wick and little body, the market is rejecting both
+            # directions = chop, and momentum entries get picked off by the
+            # next wick.  Skip the entry when wick share of total range exceeds
+            # the threshold.  (wick_filter_thresh=0 disables it.)
+            if wick_filter_thresh > 0:
+                _r = df3_now.iloc[-wick_lookback:]
+                _rng  = float((_r["high"] - _r["low"]).sum())
+                _body = float((_r["close"] - _r["open"]).abs().sum())
+                _wick_share = (_rng - _body) / _rng if _rng > 0 else 0.0
+                if _wick_share > wick_filter_thresh:
+                    continue   # wicky/chop regime → stand aside
+
             entry_price = cur["close"]
+
+            # ATR-widened INITIAL stop (test-only).  The engine's cloud stop can
+            # be far too tight on high-range names ($2.74 on META vs a $29 range),
+            # so an early noise dip stops you out before the cloud-led move.  When
+            # atr_stop_mult>0, widen the initial stop to at least that fraction of
+            # ATR, capped at MAX_STOP_PCT so risk stays bounded.
+            if atr_stop_mult > 0 and sym_data[sym]["atr"] > 0:
+                _min_dist = atr_stop_mult * sym_data[sym]["atr"]
+                _cap_dist = MAX_STOP_PCT * entry_price          # don't exceed 2.5%
+                _min_dist = min(_min_dist, _cap_dist)
+                if signal == "long":
+                    stop_price = min(stop_price, entry_price - _min_dist)
+                else:
+                    stop_price = max(stop_price, entry_price + _min_dist)
+
             stop_dist   = abs(entry_price - stop_price)
             if stop_dist < MIN_STOP_DIST:
                 continue

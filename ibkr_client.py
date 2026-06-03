@@ -19,14 +19,14 @@ import json
 import logging
 import os
 import pathlib
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 from typing import Optional
 
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder, Order
 
 from config import (TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
-                    BAR_SIZE_10M, BAR_SIZE_3M,
+                    BAR_SIZE_10M, BAR_SIZE_3M, BAR_SIZE_5M,
                     MAX_SIMULTANEOUS_POSITIONS,
                     FIXED_SHARES, FIXED_SHARES_HIGH, HIGH_PRICE_THRESHOLD,
                     STARTER_RATIO, ADD_TRIGGER_PROFIT,
@@ -41,7 +41,9 @@ from config import (TWS_HOST, TWS_PORT, TWS_CLIENT_ID,
                     GAP_ENTRY_END_HOUR,   GAP_ENTRY_END_MINUTE,
                     VOLUME_CONFIRM_MULT, DEBUG_SIGNALS,
                     PROFIT_TARGET_SHARE,
-                    PAPER_DATA_DELAY_MINUTES)
+                    PAPER_DATA_DELAY_MINUTES,
+                    ORB_ENABLED, ORB_MINUTES, ORB_STOP_MODE, ORB_FULL_SIZE,
+                    ORB_ENTRY_PAD, MIN_STOP_DIST)
 from ema_engine import (compute_emas, get_trend_10m,
                         get_entry_signal_3m, get_gap_signal_3m,
                         get_open_cloud_break_signal_3m,
@@ -190,6 +192,12 @@ class TradingBot:
         # deadlocks that happen when reqHistoricalData is called inside a callback.
         self._3m_update_set:  set = set()
         self._10m_update_set: set = set()
+
+        # ORB (opening-range breakout) state, one entry per symbol per day.
+        # {symbol: {"date": date, "high": float|None, "low": float|None,
+        #           "fired": bool}}
+        self.orb_enabled = ORB_ENABLED   # instance flag (tests can toggle)
+        self._orb_state: dict = {}
 
     # ----------------------------------------------------------------------
     # Connection
@@ -415,10 +423,37 @@ class TradingBot:
         """With keepUpToDate=True, bars[-1] is always the live (incomplete) bar
         being updated in real-time.  Return a plain list excluding it so that
         signal functions always operate on fully-closed bars only.
-        Safe to call with keepUpToDate=False lists too — worst case we lose
-        one completed bar, which is harmless given 200+ bars of history."""
+        Do not use this for keepUpToDate=False snapshots when the latest bar
+        matters; use _closed_snapshot_bars() so the timestamp decides."""
         lst = list(bars)
         return lst[:-1] if len(lst) > 1 else lst
+
+    @staticmethod
+    def _closed_snapshot_bars(bars, now: datetime, bar_minutes: int) -> list:
+        """Completed bars from a historical snapshot.
+
+        IBKR historical snapshots can already be completed-only, while live
+        subscriptions have a trailing forming bar.  For stop-style ORB entries
+        the latest completed 5-min bar matters, so filter by bar start time
+        instead of blindly dropping bars[-1].
+        """
+        cutoff = pd.Timestamp(now)
+        if cutoff.tzinfo is not None:
+            cutoff = cutoff.tz_convert("US/Eastern")
+        cutoff = cutoff.to_pydatetime().replace(tzinfo=None)
+
+        out = []
+        for b in list(bars or []):
+            try:
+                bt = pd.Timestamp(b.date)
+                if bt.tzinfo is not None:
+                    bt = bt.tz_convert("US/Eastern")
+                start = bt.to_pydatetime().replace(tzinfo=None)
+            except Exception:
+                continue
+            if start + timedelta(minutes=bar_minutes) <= cutoff:
+                out.append(b)
+        return out
 
     # ----------------------------------------------------------------------
     # 1-min position management — ratchet + stop every minute while in trade
@@ -619,7 +654,26 @@ class TradingBot:
                       f"Check market data subscription.")
             if not hasattr(self, "_warned_rt_none"):
                 self._warned_rt_none = set()
-            self._warned_rt_none.add(symbol)
+                self._warned_rt_none.add(symbol)
+        return None
+
+    def _orb_live_price(self, symbol: str):
+        """Live-only price for ORB software stops.
+
+        Unlike _rt_price(), this deliberately refuses portfolio and bar-close
+        fallbacks.  A breakout entry must be triggered by current market data,
+        not a stale management fallback.
+        """
+        t = self.tickers.get(symbol)
+        if t is None:
+            return None
+        px = t.last
+        if px and px == px:
+            return px
+        midpoint = getattr(t, "midpoint", None)
+        mid = midpoint() if callable(midpoint) else midpoint
+        if mid and mid == mid:
+            return mid
         return None
 
     # ----------------------------------------------------------------------
@@ -714,6 +768,269 @@ class TradingBot:
         self.trend[symbol] = get_trend_10m(df)
         if self.trend[symbol] != prev:
             log.info(f"  {symbol}  10m trend: {prev} -> {self.trend[symbol]}")
+
+    # ----------------------------------------------------------------------
+    # Opening-Range Breakout entry
+    # ----------------------------------------------------------------------
+
+    def _orb_window_end(self):
+        """datetime.time at which the opening range closes (09:30 + ORB_MINUTES)."""
+        total = 30 + ORB_MINUTES
+        return time(MARKET_OPEN_HOUR + total // 60, total % 60)
+
+    def _orb_range_from_bars(self, bars, today):
+        """High/low of 1-min bars whose start falls in the half-open window
+        [09:30:00, 09:40:00) on `today` — i.e. EXACTLY the first 10 minutes.
+        IBKR (and yfinance) label intraday bars at the bar START, so a bar at
+        09:39:00 covers 09:39-09:40 (in) and a bar at 09:40:00 covers 09:40-09:41
+        (out).  Returns (high, low) or None.  This is the ONLY source of the OR;
+        the coarse 3-min bars are never used to derive the range."""
+        or_start = time(MARKET_OPEN_HOUR, 30)
+        or_end   = self._orb_window_end()
+        highs, lows = [], []
+        for b in bars:
+            bt = pd.Timestamp(b.date)
+            if bt.date() != today:
+                continue
+            tt = bt.time()
+            if or_start <= tt < or_end:
+                highs.append(float(b.high))
+                lows.append(float(b.low))
+        if not highs:
+            return None
+        return max(highs), min(lows)
+
+    def _compute_orb_range_1m(self, symbol, today):
+        """Fetch 1-min RTH bars and return the exact 09:30-09:40 (high, low),
+        or None.  Done once per symbol per day (result cached in _orb_state)."""
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            self.ib.qualifyContracts(contract)
+            bars_1m = self.ib.reqHistoricalData(
+                contract, endDateTime="", durationStr="1 D",
+                barSizeSetting="1 min", whatToShow="TRADES",
+                useRTH=True, keepUpToDate=False,
+            )
+            return self._orb_range_from_bars(bars_1m or [], today)
+        except Exception as e:
+            log.warning(f"  {symbol}: ORB 1m range fetch failed — {e}")
+            return None
+
+    def _refresh_orb_5m(self, now=None):
+        """Evaluate ORB breakouts on 5-MINUTE bars — the tested ORB timeframe.
+
+        Kept as a parity/fallback path.  The production main loop uses
+        _refresh_orb_live() so entries can fire at the break instead of waiting
+        for the 5-min candle to close.
+        """
+        if not self.orb_enabled:
+            return
+        now = now or datetime.now()
+        effective_now = (now - timedelta(minutes=PAPER_DATA_DELAY_MINUTES)
+                         if TWS_PORT != 7496 else now)
+        if effective_now.time() < self._orb_window_end():
+            return                              # OR window not closed yet
+
+        for symbol in list(self.symbols):
+            # Entry guards — mirror the 3-min handler's entry section so ORB
+            # and cloud share the slot/trade-count limits consistently.
+            if symbol in self.positions or symbol in self._pending_entries:
+                continue
+            if (len(self.positions) + len(self._pending_entries)
+                    + len(self._pending_flattens)) >= MAX_SIMULTANEOUS_POSITIONS:
+                break
+            if self._trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
+                continue
+            st = self._orb_state.get(symbol)
+            if st and st.get("date") == now.date() and st.get("fired"):
+                continue
+
+            try:
+                contract = Stock(symbol, "SMART", "USD")
+                self.ib.qualifyContracts(contract)
+                bars_5m = self.ib.reqHistoricalData(
+                    contract, endDateTime="", durationStr="1 D",
+                    barSizeSetting=BAR_SIZE_5M, whatToShow="TRADES",
+                    useRTH=True, keepUpToDate=False,
+                )
+            except Exception as e:
+                log.warning(f"  {symbol}: ORB 5m fetch failed — {e}")
+                continue
+
+            closed = self._closed_snapshot_bars(bars_5m, effective_now, 5)
+            if not closed:
+                continue
+            cur = closed[-1]                    # last CLOSED 5-min bar (raw bar)
+            try:
+                self._try_orb_entry(symbol, cur, now, effective_now)
+            except Exception as e:
+                log.warning(f"  {symbol}: ORB entry eval error — {e}")
+
+    def _refresh_orb_live(self, now=None):
+        """Software stop-entry for live ORB.
+
+        The backtest can only see that a 5-min bar crossed the trigger, so it
+        books the trigger price.  Live can do better: once the exact 1-min OR is
+        cached, check real-time price every loop tick and place the entry as
+        soon as the trigger is crossed while still enforcing the global slot cap.
+        """
+        if not self.orb_enabled:
+            return
+        now = now or datetime.now()
+        effective_now = (now - timedelta(minutes=PAPER_DATA_DELAY_MINUTES)
+                         if TWS_PORT != 7496 else now)
+        if effective_now.time() < self._orb_window_end():
+            return
+
+        for symbol in list(self.symbols):
+            if symbol in self.positions or symbol in self._pending_entries:
+                continue
+            if (len(self.positions) + len(self._pending_entries)
+                    + len(self._pending_flattens)) >= MAX_SIMULTANEOUS_POSITIONS:
+                break
+            if self._trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
+                continue
+            st = self._orb_state.get(symbol)
+            if st and st.get("date") == now.date() and st.get("fired"):
+                continue
+
+            live_px = self._orb_live_price(symbol)
+            if live_px is None:
+                continue
+            cur = pd.Series({"open": live_px, "high": live_px,
+                             "low": live_px, "close": live_px})
+            try:
+                self._try_orb_entry(symbol, cur, now, effective_now,
+                                    trigger_source="live_price")
+            except Exception as e:
+                log.warning(f"  {symbol}: ORB live entry eval error — {e}")
+
+    def _try_orb_entry(self, symbol, cur, now, effective_now,
+                       trigger_source="5min_bar") -> bool:
+        """Opening-Range Breakout entry — STOP-STYLE breakout, not candle-close.
+
+          * OR is the exact 09:30:00-09:40:00 range, built from 1-min bars
+            (never from the coarse 3-min/5-min entry frame).
+          * Triggers:  long = OR_high + ORB_ENTRY_PAD,  short = OR_low - ORB_ENTRY_PAD.
+          * `cur` is either a just-closed 5-MINUTE bar (backtest parity) or a
+            live-price synthetic bar (production software stop).  Entry/risk use
+            the TRIGGER price — NOT cur.close.  Fill drift from the trigger is
+            caught by _open_position's FILL_DRIFT guard.
+          * One shot per symbol per day.  If BOTH triggers are crossed in the
+            same bar it's ambiguous → skip and do NOT consume the one-shot.
+
+        Reuses _open_position so crash-stop / fill-callback / EMERGENCY_FLATTEN /
+        reconciliation / pending-slot counting all apply unchanged.  Returns True
+        if it placed an entry (caller should return), else False.
+        """
+        today = now.date()
+        st = self._orb_state.get(symbol)
+        if st is None or st.get("date") != today:
+            st = {"date": today, "high": None, "low": None, "fired": False}
+            self._orb_state[symbol] = st
+        if st["fired"]:
+            return False
+
+        # Wait until the opening-range window has fully closed.  Use
+        # effective_now so the paper-data delay doesn't shift the window.
+        if effective_now.time() < self._orb_window_end():
+            return False
+
+        # Build the EXACT 09:30-09:40 range from 1-min bars, once (cached).
+        if st["high"] is None:
+            rng = self._compute_orb_range_1m(symbol, today)
+            if rng is None:
+                return False          # range not available yet — retry next bar
+            st["high"], st["low"] = rng
+        orb_high, orb_low = st["high"], st["low"]
+        orb_rng = orb_high - orb_low
+        if orb_rng <= 0:
+            return False
+
+        # Stop-style triggers (entry estimate is the TRIGGER, never the close).
+        long_trigger  = round(orb_high + ORB_ENTRY_PAD, 2)
+        short_trigger = round(orb_low  - ORB_ENTRY_PAD, 2)
+        hit_long  = float(cur.high) >= long_trigger
+        hit_short = float(cur.low)  <= short_trigger
+        if hit_long and hit_short:
+            # Both sides crossed in one bar → ambiguous.  Skip WITHOUT consuming
+            # the one-shot; a later bar may resolve to a clean single break.
+            return False
+        if not hit_long and not hit_short:
+            return False
+        direction = "long" if hit_long else "short"
+        entry_est = long_trigger if direction == "long" else short_trigger
+
+        # Initial stop per mode.
+        if ORB_STOP_MODE == "third_from_break":
+            stop_price = (round(orb_high - orb_rng / 3, 2) if direction == "long"
+                          else round(orb_low + orb_rng / 3, 2))
+        elif ORB_STOP_MODE == "midpoint":
+            stop_price = round((orb_high + orb_low) / 2, 2)
+        else:  # full_range
+            stop_price = (round(orb_low - ORB_ENTRY_PAD, 2) if direction == "long"
+                          else round(orb_high + ORB_ENTRY_PAD, 2))
+
+        stop_dist = abs(entry_est - stop_price)
+        if stop_dist < MIN_STOP_DIST:
+            st["fired"] = True
+            return False
+
+        # Sizing — full size at the break (no pyramid for ORB by default).
+        # Risk uses the TRIGGER estimate, not the breakout candle's close.
+        n_full = FIXED_SHARES_HIGH if entry_est >= HIGH_PRICE_THRESHOLD else FIXED_SHARES
+        if ORB_FULL_SIZE:
+            n, n_add = n_full, 0
+        else:
+            n     = max(1, int(n_full * STARTER_RATIO))
+            n_add = n_full - n
+        risk     = stop_dist * n
+        risk_cap = MAX_RISK_DOLLARS_HIGH if entry_est >= HIGH_PRICE_THRESHOLD else MAX_RISK_DOLLARS
+        if risk > risk_cap:
+            tlog.info(f"SKIP  {symbol}  ORB {direction.upper()}  "
+                      f"risk=${risk:.0f} > cap ${risk_cap}  "
+                      f"trigger=${entry_est:.2f}  ORB[{orb_low:.2f}-{orb_high:.2f}]")
+            st["fired"] = True     # one-shot — don't keep retrying this symbol
+            return False
+
+        # Pre-fill inversion / wide-stop guard (against live price).
+        live_px = self._rt_price(symbol)
+        if live_px is not None:
+            inverted = ((direction == "long"  and stop_price >= live_px) or
+                        (direction == "short" and stop_price <= live_px))
+            if inverted:
+                tlog.info(f"SKIP_INVERTED  ORB {direction.upper():<5} {symbol}  "
+                          f"live=${live_px:.2f} stop=${stop_price:.2f} wrong side")
+                st["fired"] = True
+                return False
+            if abs(live_px - stop_price) / live_px > MAX_STOP_PCT:
+                tlog.info(f"SKIP_WIDE  ORB {direction.upper():<5} {symbol}  "
+                          f"live=${live_px:.2f} stop=${stop_price:.2f}")
+                st["fired"] = True
+                return False
+
+        st["fired"] = True
+        slot = (len(self.positions) + len(self._pending_entries)
+                + len(self._pending_flattens) + 1)
+        source_label = ("live software stop" if trigger_source == "live_price"
+                        else "5min bar stop-sim")
+        log.info(f"  SIGNAL: ORB {direction.upper():<5} {symbol}  [{source_label}]  "
+                 f"x{n}sh+{n_add}add  trigger=${entry_est:.2f}  stop=${stop_price:.2f}  "
+                 f"ORB[{orb_low:.2f}-{orb_high:.2f}]  risk=${risk:.0f}  "
+                 f"slot {slot}/{MAX_SIMULTANEOUS_POSITIONS}")
+        # entry_est (the trigger) is passed as the intended entry/drift baseline.
+        # The actual MKT fill may differ by slippage; _open_position's drift guard
+        # measures against this trigger estimate.
+        self._open_position(symbol, direction, entry_est, stop_price, n, now,
+                            shares_full=n_full, shares_add=n_add,
+                            entry_reason="orb_break",
+                            level_res=None, level_sup=None,
+                            entry_meta={"slot": slot, "n_add": n_add,
+                                        "stop_dist": stop_dist, "risk": risk,
+                                        "trigger_source": trigger_source,
+                                        "trend": self.trend.get(symbol, "none"),
+                                        "sup": None, "res": None})
+        return True
 
     # ----------------------------------------------------------------------
     # 3-min bar handler — entry + full position management
@@ -875,6 +1192,10 @@ class TradingBot:
             return
         if self._trades_today.get(symbol, 0) >= MAX_TRADES_PER_DAY:
             return
+
+        # NOTE: ORB is INTENTIONALLY NOT evaluated here.  The live ORB path is
+        # a software stop trigger off live price after the exact 1-min opening
+        # range is cached; the 3-min cloud handler would be the wrong layer.
 
         # Rip's levels for this symbol (None = rules-only, no filter applied)
         plan_entry = self.plan.get(symbol, {})
@@ -1309,6 +1630,59 @@ class TradingBot:
                      f"STP@${stop_price:.2f}  (order #{_stop_trade.order.orderId})")
         except Exception as _e:
             log.warning(f"  {symbol}: crash stop placement failed — {_e}")
+
+    def _apply_add_fill(self, pos, symbol: str, contract, add_px: float, add_sh: int):
+        """Handle a pyramid add-in fill.  Fixes the 06-01 AVGO/CRM bug where the
+        add doubled the position but left the crash STP at the starter quantity
+        AND left the stop at the original (now-far) level, ballooning risk.
+
+        On add we:
+          1) reblend the average entry,
+          2) RAISE the stop to at least the starter's breakeven (the add only
+             fires when the starter is +ADD_TRIGGER_PROFIT, so this sits safely
+             below price) — adding now TIGHTENS risk instead of doubling it,
+          3) re-anchor the ratchet HWM to the NEW blended entry so the reblend
+             doesn't leave best_unrealised measured against the old entry (which
+             would compute a trail floor above current price), and
+          4) RESIZE + reprice the crash STP to cover the FULL position.
+        """
+        starter_entry = pos.entry_price                 # capture BEFORE reblend
+        total_sh      = pos.shares + add_sh
+        avg_px        = (pos.entry_price * pos.shares + add_px * add_sh) / total_sh
+        pos.add_entry_price = add_px
+        pos.entry_price     = avg_px
+        pos.shares          = total_sh
+        pos.original_shares = total_sh
+
+        # (2) raise the stop to the starter's breakeven (never loosen)
+        if pos.direction == "long":
+            pos.stop_price = max(pos.stop_price, starter_entry)
+        else:
+            pos.stop_price = min(pos.stop_price, starter_entry)
+
+        # (3) re-anchor ratchet HWM to the new blended entry
+        _cur = ((add_px - pos.entry_price) if pos.direction == "long"
+                else (pos.entry_price - add_px))
+        pos.best_unrealised = max(0.0, _cur)
+
+        # (4) resize + reprice the crash STP to the FULL position
+        _crash_trade = self._twss_stop_orders.get(symbol)
+        if _crash_trade is not None:
+            _crash_ord = _crash_trade.order
+            _crash_ord.totalQuantity = total_sh
+            _crash_ord.auxPrice      = round(pos.stop_price, 2)
+            try:
+                self.ib.placeOrder(contract, _crash_ord)   # modify in place
+                log.info(f"  CRASH STOP resized: {symbol}  qty={total_sh}sh  "
+                         f"STP@${pos.stop_price:.2f}")
+            except Exception as _ce:
+                log.warning(f"  {symbol}: crash stop resize failed — {_ce}")
+
+        log.info(f"  ADD FILLED: {symbol}  @${add_px:.2f}  avg_entry=${avg_px:.2f}  "
+                 f"total={total_sh}sh  stop->${pos.stop_price:.2f}")
+        tlog.info(f"ADD_FILL  {symbol}  x{add_sh}sh  @${add_px:.2f}  "
+                  f"avg=${avg_px:.2f}  total={total_sh}sh  stop=${pos.stop_price:.2f}")
+        return pos
 
     def _close_partial(self, symbol: str, shares: int,
                        price: float, time: datetime,
@@ -1942,6 +2316,7 @@ class TradingBot:
         # here after ib.sleep() returns — no reentrancy risk.
         # 1-min management still polls because 1m bars use a one-shot request.
         last_1m_id  = -1   # bar-close ID already processed for 1m position management
+        last_orb_id = -1   # second ID already evaluated for live ORB trigger
 
         # Reconnect counter — try 3x then give up gracefully
         _reconnect_attempts = 0
@@ -2158,23 +2533,12 @@ class TradingBot:
                                      f"placing {_add_action} {_add_sh}sh")
 
                             def _on_add_fill(t, fill,
-                                             _p=_pos, _s=_sym, _ash=_add_sh):
-                                add_px   = fill.execution.avgPrice
-                                total_sh = _p.shares + _ash
-                                avg_px   = (_p.entry_price * _p.shares
-                                            + add_px * _ash) / total_sh
-                                _p.add_entry_price = add_px
-                                _p.entry_price     = avg_px
-                                _p.shares          = total_sh
-                                _p.original_shares = total_sh
-                                log.info(
-                                    f"  ADD FILLED: {_s}  @${add_px:.2f}  "
-                                    f"avg_entry=${avg_px:.2f}  total={total_sh}sh"
-                                )
-                                tlog.info(
-                                    f"ADD_FILL  {_s}  x{_ash}sh  @${add_px:.2f}  "
-                                    f"avg=${avg_px:.2f}  total={total_sh}sh"
-                                )
+                                             _p=_pos, _s=_sym, _ash=_add_sh,
+                                             _c=_add_contract):
+                                # Reblend entry, raise the stop, re-anchor the
+                                # ratchet, and resize the crash STP to full size.
+                                self._apply_add_fill(
+                                    _p, _s, _c, fill.execution.avgPrice, _ash)
 
                             _add_trade.fillEvent += _on_add_fill
                         except Exception as _e:
@@ -2226,6 +2590,18 @@ class TradingBot:
                         self._refresh_bars_1m()
                     except Exception as _e:
                         log.warning(f"  _refresh_bars_1m error: {_e}")
+
+            # -- ORB live software stop-entry ------------------------------
+            # The 5-min backtest books trigger-price fills when a bar crosses
+            # ORH/ORL. Live uses the real-time price as the stop trigger so we
+            # do not wait for the 5-min close, while still enforcing slots.
+            bar_orb_id = now.hour * 10000 + now.minute * 100 + now.second
+            if self.orb_enabled and bar_orb_id != last_orb_id:
+                last_orb_id = bar_orb_id
+                try:
+                    self._refresh_orb_live(now)
+                except Exception as _e:
+                    log.warning(f"  _refresh_orb_live error: {_e}")
 
             # -- Event-driven bar processing -------------------------------
             # keepUpToDate=True pushes completed bars via updateEvent callbacks.

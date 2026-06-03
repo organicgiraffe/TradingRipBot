@@ -1,12 +1,14 @@
 {
-  "_comment": "Today's trading plan from Rip's News Play sheet. Edit symbols and levels each morning, then just run: python main.py",
-  "date": "2026-05-29",
+  "date": "2026-06-02",
+  "_comment": "DO NOT RUN LIVE BOT — paper API on 15-min DELAYED data until IBKR funded ~June 8. For manual trading / backtest only.",
   "symbols": [
-    { "symbol": "SNDK", "support": 1662.5, "resistance": 1670.0 },
-    { "symbol": "MU",   "support": 940.0,  "resistance": 945.0 },
-    { "symbol": "LLY",  "support": 1115.0, "resistance": 1130.0 },
-    { "symbol": "AMD",  "support": 518.0,  "resistance": 522.0 },
-    { "symbol": "CRM",  "support": 180.0,  "resistance": 180.85 },
-    { "symbol": "PLTR", "support": 146.5,  "resistance": 148.4 }
+    { "symbol": "MRVL", "support": 250.0,  "resistance": 265.0 },
+    { "symbol": "DELL", "support": 470.0,  "resistance": 500.0 },
+    { "symbol": "HPE",  "support": 57.0,   "resistance": 62.0 },
+    { "symbol": "CRDO", "support": 214.0,  "resistance": 226.0 },
+    { "symbol": "DG",   "support": 113.5,  "resistance": 117.0 },
+    { "symbol": "NVDA", "support": 225.0,  "resistance": 229.5 },
+    { "symbol": "MCHP", "support": 99.0,   "resistance": 101.5 },
+    { "symbol": "IBM",  "support": 305.0,  "resistance": 315.0 }
   ]
 }

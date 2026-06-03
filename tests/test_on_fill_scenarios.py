@@ -220,6 +220,49 @@ def test_pending_flatten_counts_toward_slot():
     print("  PASS  test_pending_flatten_counts_toward_slot")
 
 
+def test_add_in_resizes_and_raises_stop():
+    """The 06-01 AVGO/CRM bug: pyramid add doubled the position but left the
+    crash STP at the starter quantity (50 of 100 covered) AND left the stop at
+    the original far level (risk doubled).  After the fix, the add must:
+      - reblend the entry,
+      - RAISE the stop to the starter's breakeven,
+      - RESIZE + reprice the crash STP to the full position."""
+    from tests.mock_ib import (MockOrder, MockTrade, MockContract,
+                               MockOrderStatus, MockEventList)
+    from position import Position
+
+    bot, ib = make_bot(["AVGO"])
+    # starter: LONG 50 @ $459.21, stop $456.66
+    pos = Position(symbol="AVGO", direction="long", shares=50,
+                   entry_price=459.21, entry_time=datetime(2026, 6, 1, 11, 54),
+                   stop_price=456.66, shares_full=100, shares_add=50)
+    bot.positions["AVGO"] = pos
+    # crash STP currently covers only the starter 50 @ $456.66
+    contract  = MockContract("AVGO")
+    stp_order = MockOrder(orderId=4651, action="SELL", totalQuantity=50,
+                          orderType="STP", auxPrice=456.66)
+    bot._twss_stop_orders["AVGO"] = MockTrade(
+        order=stp_order, contract=contract,
+        orderStatus=MockOrderStatus(status="PreSubmitted", remaining=50),
+        fillEvent=MockEventList(), cancelledEvent=MockEventList())
+
+    # add fills: +50 @ $462.49  (starter was +$3.28 → trigger)
+    bot._apply_add_fill(pos, "AVGO", contract, add_px=462.49, add_sh=50)
+
+    assert pos.shares == 100, f"expected 100sh, got {pos.shares}"
+    assert abs(pos.entry_price - 460.85) < 0.01, f"blended entry wrong: {pos.entry_price}"
+    assert pos.stop_price == 459.21, (
+        f"stop should be RAISED to starter breakeven 459.21, got {pos.stop_price}")
+    assert stp_order.totalQuantity == 100, (
+        f"crash STP should cover full 100sh, got {stp_order.totalQuantity}")
+    assert abs(stp_order.auxPrice - 459.21) < 0.01, (
+        f"crash STP should be repriced to 459.21, got {stp_order.auxPrice}")
+    # risk after fix vs before
+    risk_after = (pos.entry_price - pos.stop_price) * pos.shares   # (460.85-459.21)*100
+    assert risk_after < 200, f"risk should be bounded (~$164), got ${risk_after:.0f}"
+    print("  PASS  test_add_in_resizes_and_raises_stop")
+
+
 if __name__ == "__main__":
     tests = [
         test_clean_entry_creates_position,
@@ -228,6 +271,7 @@ if __name__ == "__main__":
         test_emergency_flatten_unconfirmed_adopts,
         test_fill_drift_queues_flatten,
         test_pending_flatten_counts_toward_slot,
+        test_add_in_resizes_and_raises_stop,
     ]
     passed = 0
     failed = []
