@@ -430,37 +430,52 @@ def _print_trade(t):
 # Today's picks — read directly from Rip's Daily Levels sheet
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    print("\nRIP'S DAILY PLAYS  —  May 22, 2026  (Lotto Friday)")
+    print("\nRIP'S DAILY PLAYS  —  June 4, 2026")
     print("=" * 65)
-    print("  SOURCE: Rip's Day2/Day3 Play + News Play + Wakeup Summary")
+    print("  SOURCE: Rip's Daily Levels + Day2/Day3 Play + News Play")
+    print("  MARKET: Gap down — Tech earnings + Iran unresolved")
+    print("          VIX 16.33 key level. Be patient, trade vs PM levels.")
+    print("          Need VIX < 16.30 + yields drop for sustained bounce.")
     print()
-    print("  DAY2/DAY3 CONTINUATION PLAYS:")
-    print("  TSLA  — Daily looking good, long over PMH, watch flow       bias=LONG")
-    print("  AAOI  — Bullish bias long over YH or 34/50 EMA curl         bias=LONG")
-    print("  INTU  — Earnings Day2, bearish under 305/EMA break          bias=SHORT")
-    print("  DELL  — Evercore ISI Tactical Outperform add, PT $270       bias=LONG")
+    print("  INDEX ETFs (trade vs PM levels, follow clouds):")
+    print("  SPY   — sup 749.77 / res 752.65                  bias=ANY")
+    print("  QQQ   — sup 733.00 / res 737.60                  bias=ANY")
     print()
-    print("  TIER 1 BANK CATALYST PLAYS:")
-    print("  SPOT  — JPMorgan raises PT  (Tier 1)                        bias=LONG")
-    print("  INSP  — BofA downgrade  (Tier 1)                            bias=SHORT")
+    print("  EARNINGS BEATS (strongest catalysts):")
+    print("  AVGO  — Beat all metrics, Q3 revs above cons      bias=LONG")
+    print("          curl over 412 only if semis sector strong")
+    print("  COST  — Beat revs +14.5% YoY, Day2 highlighted   bias=LONG")
+    print("          bullish above 975, watching for $1K breakout")
     print()
-    print("  SKIP:  AMD (wide $16 range, no clean bias)")
-    print("  SKIP:  NVDA (Inside Day, 'no go under 220')")
+    print("  KEY TECH MOVER:")
+    print("  NVDA  — Curl vs 212.50, no go under, watch mkt    bias=LONG")
+    print()
+    print("  EARNINGS DAY2 SHORT:")
+    print("  PANW  — Bearish under PML / 34-50 break           bias=SHORT")
+    print()
+    print("  SKIP:  MRVL ($300 magnet, too extended)")
+    print("  SKIP:  CRWD (neutral curl bias, no clean direction)")
+    print("  SKIP:  META / GOOGL (choppy premarket)")
+    print("  SKIP:  AMD (wide range, no clean setup)")
     print("=" * 65)
 
     setups = {
-        "TSLA": {"support": 449.45, "resistance": 452.00, "bias": "long",
-                 "note": "Daily looking good, long over PMH"},
-        "AAOI": {"support": 59.50,  "resistance": 63.90,  "bias": "long",
-                 "note": "Bullish long over YH or 34/50 EMA curl"},
-        "INTU": {"support": 302.40, "resistance": 309.00, "bias": "short",
-                 "note": "Earnings Day2 — bearish under 305"},
-        "DELL": {"support": None,   "resistance": None,   "bias": "long",
-                 "note": "Evercore ISI Tactical Outperform, PT $270"},
-        "SPOT": {"support": None,   "resistance": None,   "bias": "long",
-                 "note": "JPMorgan raises PT (Tier 1 bank)"},
-        "INSP": {"support": None,   "resistance": None,   "bias": "short",
-                 "note": "BofA downgrade (Tier 1 bank)"},
+        # ── Index ETFs ─────────────────────────────────────────────────
+        "SPY":  {"support": 749.77, "resistance": 752.65, "bias": "any",
+                 "note": "Trade vs PM levels + follow clouds; VIX 16.33 key"},
+        "QQQ":  {"support": 733.00, "resistance": 737.60, "bias": "any",
+                 "note": "Tech ETF direction play; outer res 741.00"},
+        # ── Earnings beats ─────────────────────────────────────────────
+        "AVGO": {"support": 403.50, "resistance": 412.00, "bias": "long",
+                 "note": "Beat all metrics; curl over 412 if semis strong; outer res 416"},
+        "COST": {"support": 978.00, "resistance": 984.00, "bias": "long",
+                 "note": "Beat revs +14.5% YoY; bullish above 975; target $1K breakout"},
+        # ── Key tech mover ─────────────────────────────────────────────
+        "NVDA": {"support": 211.39, "resistance": 214.50, "bias": "long",
+                 "note": "Curl vs 212.50; no go under 211.39; watch market direction"},
+        # ── Earnings Day2 short ────────────────────────────────────────
+        "PANW": {"support": 275.80, "resistance": 277.00, "bias": "short",
+                 "note": "Earnings Day2; bearish under PML / 34-50 break"},
     }
 
     all_trades = run_multi_today(setups)
