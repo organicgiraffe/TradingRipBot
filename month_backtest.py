@@ -1,5 +1,6 @@
 """
-month_backtest.py — 30-stock, 22-day synthetic backtest of the HOD Breakout strategy.
+month_backtest.py — 30-stock full-year 2026 backtest of the HOD Breakout strategy,
+broken down by calendar month.
 
 NOTE: yfinance / Alpaca data endpoints are blocked in this environment.
       This uses calibrated synthetic price data (GBM + realistic intraday patterns)
@@ -61,16 +62,24 @@ UNIVERSE = {
     "SOFI": (14,   0.0410, 0),
 }
 
-# ── Trading calendar: 22 business days ending today ───────────────────────────
-def _trading_days(n: int = 22) -> list:
-    today = datetime.date(2026, 6, 4)
-    days  = []
-    d     = today
-    while len(days) < n:
-        if d.weekday() < 5:   # Mon–Fri
+# ── Trading calendar: all 2026 trading days Jan 2 → Jun 4 ─────────────────────
+_2026_HOLIDAYS = {
+    datetime.date(2026, 1,  1),   # New Year's Day
+    datetime.date(2026, 1, 19),   # MLK Day
+    datetime.date(2026, 2, 16),   # Presidents' Day
+    datetime.date(2026, 4,  3),   # Good Friday
+    datetime.date(2026, 5, 25),   # Memorial Day
+}
+
+def _trading_days(start: datetime.date = datetime.date(2026, 1, 2),
+                  end:   datetime.date = datetime.date(2026, 6, 4)) -> list:
+    days = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5 and d not in _2026_HOLIDAYS:
             days.append(d)
-        d -= datetime.timedelta(days=1)
-    return sorted(days)
+        d += datetime.timedelta(days=1)
+    return days
 
 
 # ── Synthetic data generator ───────────────────────────────────────────────────
@@ -293,121 +302,153 @@ def _run_symbol(symbol: str, base_price: float, daily_vol: float,
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def run_month_backtest():
-    trading_days = _trading_days(22)
-    print(f"\n{'='*70}")
-    print(f"  HOD BREAKOUT / LOD BREAKDOWN  —  30-STOCK  22-DAY BACKTEST")
-    print(f"  Period : {trading_days[0]} → {trading_days[-1]}")
-    print(f"  NOTE   : Calibrated synthetic data (yfinance blocked in env)")
-    print(f"{'='*70}\n")
+def _month_label(d: datetime.date) -> str:
+    return d.strftime("%b %Y")
 
-    all_trades   = []
-    sym_results  = {}
+def _stats(trades: list) -> dict:
+    if not trades:
+        return dict(n=0, wins=0, losses=0, wr=0, total=0, avg_w=0, avg_l=0, pf=0, rr=0)
+    wins   = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    total  = sum(t["pnl"] for t in trades)
+    avg_w  = sum(t["pnl"] for t in wins)   / len(wins)   if wins   else 0
+    avg_l  = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
+    gross_w = sum(t["pnl"] for t in wins)
+    gross_l = abs(sum(t["pnl"] for t in losses))
+    pf  = gross_w / gross_l if gross_l else float("inf")
+    rr  = avg_w / abs(avg_l) if avg_l else float("inf")
+    return dict(n=len(trades), wins=len(wins), losses=len(losses),
+                wr=len(wins)/len(trades)*100, total=total,
+                avg_w=avg_w, avg_l=avg_l, pf=pf, rr=rr)
 
-    symbols = list(UNIVERSE.keys())[:30]   # cap at 30
 
-    for sym in symbols:
+def run_year_backtest():
+    trading_days = _trading_days()
+    symbols      = list(UNIVERSE.keys())[:30]
+
+    print(f"\n{'='*72}")
+    print(f"  HOD BREAKOUT / LOD BREAKDOWN  —  FULL YEAR 2026  —  {len(symbols)} STOCKS")
+    print(f"  Period : {trading_days[0]}  →  {trading_days[-1]}  "
+          f"({len(trading_days)} trading days)")
+    print(f"  NOTE   : Calibrated synthetic data (yfinance/Alpaca blocked in env)")
+    print(f"{'='*72}\n")
+    print(f"  Generating data & running signal engine ...", flush=True)
+
+    all_trades  = []
+    sym_results = {}
+
+    for i, sym in enumerate(symbols):
         base_px, vol, trend = UNIVERSE[sym]
         trades = _run_symbol(sym, base_px, vol, trend, trading_days,
-                             seed=42 + symbols.index(sym))
+                             seed=42 + i)
         all_trades.extend(trades)
         sym_results[sym] = trades
+        print(f"  {sym:<6} done  ({len(trades)} trades)", flush=True)
 
-    # ── Per-symbol table ────────────────────────────────────────────────────────
-    print(f"  {'SYM':<6}  {'TIER':<7}  {'TR':>3}  {'W':>3}  {'L':>3}  "
-          f"{'WR%':>5}  {'TOT P&L':>10}  {'AVG W':>8}  {'AVG L':>8}  {'BEST':>8}")
-    print(f"  {'-'*75}")
+    # ── Monthly breakdown ───────────────────────────────────────────────────────
+    months = sorted({_month_label(t["entry_time"].date()) for t in all_trades})
+    month_order = {m: i for i, m in enumerate(
+        [datetime.date(2026, mo, 1).strftime("%b %Y") for mo in range(1, 7)])}
+    months = sorted(months, key=lambda m: month_order.get(m, 99))
 
+    # Count trading days per month
+    tdays_by_month = {}
+    for d in trading_days:
+        lbl = _month_label(d)
+        tdays_by_month[lbl] = tdays_by_month.get(lbl, 0) + 1
+
+    print(f"\n{'─'*72}")
+    print(f"  MONTHLY BREAKDOWN")
+    print(f"{'─'*72}")
+    print(f"  {'MONTH':<10} {'DAYS':>4} {'TR':>4} {'W':>4} {'L':>4} "
+          f"{'WR%':>6} {'P&L':>10} {'AVG W':>8} {'AVG L':>8} {'PF':>5} {'R:R':>5}")
+    print(f"  {'-'*69}")
+
+    running_pnl = 0.0
+    for mo in months:
+        mo_trades = [t for t in all_trades
+                     if _month_label(t["entry_time"].date()) == mo]
+        s = _stats(mo_trades)
+        running_pnl += s["total"]
+        td = tdays_by_month.get(mo, "?")
+        pf_str = f"{s['pf']:.2f}" if s["pf"] != float("inf") else " inf"
+        rr_str = f"{s['rr']:.2f}" if s["rr"] != float("inf") else " inf"
+        print(f"  {mo:<10} {td:>4} {s['n']:>4} {s['wins']:>4} {s['losses']:>4} "
+              f"{s['wr']:>5.1f}% ${s['total']:>9,.0f} "
+              f"${s['avg_w']:>7,.0f} ${s['avg_l']:>7,.0f} "
+              f"{pf_str:>5} {rr_str:>5}")
+
+    print(f"  {'-'*69}")
+    s_all = _stats(all_trades)
+    pf_str = f"{s_all['pf']:.2f}" if s_all["pf"] != float("inf") else "  inf"
+    rr_str = f"{s_all['rr']:.2f}" if s_all["rr"] != float("inf") else "  inf"
+    print(f"  {'TOTAL':<10} {len(trading_days):>4} {s_all['n']:>4} "
+          f"{s_all['wins']:>4} {s_all['losses']:>4} "
+          f"{s_all['wr']:>5.1f}% ${s_all['total']:>9,.0f} "
+          f"${s_all['avg_w']:>7,.0f} ${s_all['avg_l']:>7,.0f} "
+          f"{pf_str:>5} {rr_str:>5}")
+
+    # ── Per-symbol summary ──────────────────────────────────────────────────────
     tier_map = {1: "BULL", -1: "BEAR", 0: "CHOP"}
+    print(f"\n{'─'*72}")
+    print(f"  PER-SYMBOL SUMMARY  (full year)")
+    print(f"{'─'*72}")
+    print(f"  {'SYM':<6} {'TIER':<5} {'TR':>4} {'WR%':>6} "
+          f"{'TOTAL P&L':>11} {'AVG W':>8} {'AVG L':>8}")
+    print(f"  {'-'*56}")
     for sym in symbols:
-        t_list = sym_results[sym]
-        if not t_list:
-            print(f"  {sym:<6}  {tier_map[UNIVERSE[sym][2]]:<7}  "
-                  f"{'--':>3}  --  --  {'--':>5}  {'--':>10}")
+        s = _stats(sym_results[sym])
+        tier = tier_map[UNIVERSE[sym][2]]
+        if s["n"] == 0:
+            print(f"  {sym:<6} {tier:<5}  {'--':>4}    {'--':>5}   {'--':>10}")
             continue
-        wins   = [t for t in t_list if t["pnl"] > 0]
-        losses = [t for t in t_list if t["pnl"] <= 0]
-        total  = sum(t["pnl"] for t in t_list)
-        wr     = len(wins) / len(t_list) * 100
-        avg_w  = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
-        avg_l  = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
-        best   = max(t["pnl"] for t in t_list)
-        tier   = tier_map[UNIVERSE[sym][2]]
-        print(f"  {sym:<6}  {tier:<7}  {len(t_list):>3}  "
-              f"{len(wins):>3}  {len(losses):>3}  "
-              f"{wr:>5.1f}%  ${total:>9.2f}  "
-              f"${avg_w:>7.2f}  ${avg_l:>7.2f}  ${best:>7.2f}")
+        print(f"  {sym:<6} {tier:<5} {s['n']:>4} {s['wr']:>5.1f}% "
+              f"${s['total']:>10,.0f} ${s['avg_w']:>7,.0f} ${s['avg_l']:>7,.0f}")
 
-    # ── Aggregate stats ─────────────────────────────────────────────────────────
-    wins_all   = [t for t in all_trades if t["pnl"] > 0]
-    losses_all = [t for t in all_trades if t["pnl"] <= 0]
-    total_all  = sum(t["pnl"] for t in all_trades)
+    # ── Aggregates ──────────────────────────────────────────────────────────────
+    print(f"\n{'─'*72}")
+    print(f"  FULL-YEAR SUMMARY")
+    print(f"{'─'*72}")
+    print(f"  Total trades    : {s_all['n']}")
+    print(f"  Win rate        : {s_all['wins']}/{s_all['n']} ({s_all['wr']:.1f}%)")
+    print(f"  Total P&L       : ${s_all['total']:+,.2f}")
+    print(f"  Avg win         : ${s_all['avg_w']:+,.2f}")
+    print(f"  Avg loss        : ${s_all['avg_l']:+,.2f}")
+    print(f"  Profit factor   : {s_all['pf']:.2f}")
+    print(f"  R:R ratio       : {s_all['rr']:.2f} : 1")
+    print(f"  Signal freq     : {s_all['n']}/{len(symbols)*len(trading_days)} "
+          f"stock-days = {s_all['n']/(len(symbols)*len(trading_days))*100:.1f}%")
 
-    print(f"\n  {'='*70}")
-    print(f"  AGGREGATE  —  {len(all_trades)} trades over {len(symbols)} symbols × 22 days")
-    print(f"  {'='*70}")
-    print(f"  Total P&L   : ${total_all:+,.2f}")
-    print(f"  Win rate    : {len(wins_all)}/{len(all_trades)} "
-          f"({len(wins_all)/len(all_trades)*100:.1f}%)" if all_trades else "  No trades")
-    if wins_all:
-        print(f"  Avg win     : ${sum(t['pnl'] for t in wins_all)/len(wins_all):+.2f}")
-    if losses_all:
-        print(f"  Avg loss    : ${sum(t['pnl'] for t in losses_all)/len(losses_all):+.2f}")
-    if wins_all and losses_all:
-        avg_w = sum(t["pnl"] for t in wins_all) / len(wins_all)
-        avg_l = abs(sum(t["pnl"] for t in losses_all) / len(losses_all))
-        print(f"  Profit factor: {sum(t['pnl'] for t in wins_all) / abs(sum(t['pnl'] for t in losses_all)):.2f}")
-        print(f"  R:R ratio   : {avg_w / avg_l:.2f} : 1")
+    print(f"\n  By trend tier:")
+    for tier_val, tier_name in [(1,"BULL"),(0,"CHOP"),(-1,"BEAR")]:
+        tsyms = [s for s in symbols if UNIVERSE[s][2] == tier_val]
+        tt    = [t for t in all_trades if t["symbol"] in tsyms]
+        s     = _stats(tt)
+        if s["n"]:
+            print(f"    {tier_name:<5}: {s['n']:>4} trades  "
+                  f"{s['wr']:.1f}% WR  ${s['total']:+,.0f}  PF {s['pf']:.2f}")
 
-    # ── By exit reason ──────────────────────────────────────────────────────────
-    print(f"\n  Exit breakdown:")
-    for reason in ["stop", "cloud", "EOD"]:
-        bucket = [t for t in all_trades if t["reason"] == reason]
-        if not bucket:
-            continue
-        bw = [t for t in bucket if t["pnl"] > 0]
-        bt = sum(t["pnl"] for t in bucket)
-        print(f"    {reason:<8}: {len(bucket):>3} trades  "
-              f"{len(bw)}/{len(bucket)} wins  ${bt:+,.2f}")
-
-    # ── By tier ─────────────────────────────────────────────────────────────────
-    print(f"\n  By daily trend tier:")
-    for tier_val, tier_name in [(1, "BULL (above SMA200)"),
-                                 (-1, "BEAR (below SMA200)"),
-                                 (0,  "CHOP (at SMA200)")]:
-        tier_syms  = [s for s in symbols if UNIVERSE[s][2] == tier_val]
-        tier_trades = [t for t in all_trades if t["symbol"] in tier_syms]
-        if not tier_trades:
-            continue
-        tw    = [t for t in tier_trades if t["pnl"] > 0]
-        ttot  = sum(t["pnl"] for t in tier_trades)
-        wr    = len(tw) / len(tier_trades) * 100
-        print(f"    {tier_name:<26}: {len(tier_trades):>3} trades  "
-              f"{wr:.1f}% WR  ${ttot:+,.2f}")
-
-    # ── By direction ────────────────────────────────────────────────────────────
     print(f"\n  By direction:")
     for d in ["long", "short"]:
         dt = [t for t in all_trades if t["dir"] == d]
-        if not dt:
-            continue
-        dw = [t for t in dt if t["pnl"] > 0]
-        dtot = sum(t["pnl"] for t in dt)
-        print(f"    {d.upper():<6}: {len(dt):>3} trades  "
-              f"{len(dw)/len(dt)*100:.1f}% WR  ${dtot:+,.2f}")
+        s  = _stats(dt)
+        if s["n"]:
+            print(f"    {d.upper():<6}: {s['n']:>4} trades  "
+                  f"{s['wr']:.1f}% WR  ${s['total']:+,.0f}  PF {s['pf']:.2f}")
 
-    # ── Signal frequency ────────────────────────────────────────────────────────
-    stock_days    = len(symbols) * 22
-    signal_rate   = len(all_trades) / stock_days * 100
-    print(f"\n  Signal frequency: {len(all_trades)} signals / {stock_days} "
-          f"stock-days = {signal_rate:.1f}%")
-    print(f"  (avg {len(all_trades)/len(symbols):.1f} trades per symbol over 22 days)")
-    print(f"{'='*70}\n")
+    print(f"\n  By exit type:")
+    for reason in ["stop", "cloud", "EOD"]:
+        rt = [t for t in all_trades if t["reason"] == reason]
+        s  = _stats(rt)
+        if s["n"]:
+            print(f"    {reason:<8}: {s['n']:>4} trades  "
+                  f"{s['wr']:.1f}% WR  ${s['total']:+,.0f}")
 
+    print(f"{'='*72}\n")
     return all_trades
 
 
 if __name__ == "__main__":
     random.seed(42)
     np.random.seed(42)
-    run_month_backtest()
+    run_year_backtest()
