@@ -430,52 +430,55 @@ def _print_trade(t):
 # Today's picks — read directly from Rip's Daily Levels sheet
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
-    print("\nRIP'S DAILY PLAYS  —  June 4, 2026")
+    print("\nRIP'S DAILY PLAYS  —  June 8, 2026")
     print("=" * 65)
     print("  SOURCE: Rip's Daily Levels + Day2/Day3 Play + News Play")
-    print("  MARKET: Gap down — Tech earnings + Iran unresolved")
-    print("          VIX 16.33 key level. Be patient, trade vs PM levels.")
-    print("          Need VIX < 16.30 + yields drop for sustained bounce.")
+    print("  MARKET: GAP UP — Iran/Israel halt attacks")
+    print("          VIX 19.00 KEY LEVEL — if holds/breaks, caution.")
+    print("          Yields 4.52 key. Watchout amateur open move.")
+    print("          Neutral bias overall — pull & hold for longs.")
     print()
     print("  INDEX ETFs (trade vs PM levels, follow clouds):")
-    print("  SPY   — sup 749.77 / res 752.65                  bias=ANY")
-    print("  QQQ   — sup 733.00 / res 737.60                  bias=ANY")
+    print("  SPY   — sup 735.50 / res 742.00  VIX 19 is the gate  bias=ANY")
+    print("  QQQ   — sup 708.60 / res 717.00                       bias=ANY")
     print()
-    print("  EARNINGS BEATS (strongest catalysts):")
-    print("  AVGO  — Beat all metrics, Q3 revs above cons      bias=LONG")
-    print("          curl over 412 only if semis sector strong")
-    print("  COST  — Beat revs +14.5% YoY, Day2 highlighted   bias=LONG")
-    print("          bullish above 975, watching for $1K breakout")
+    print("  S&P 500 ADDITION:")
+    print("  MRVL  — Joins S&P 500 index, MTF bullish              bias=LONG")
+    print("          Long over MTF, profit-taking exp if breaks 1h MTF level")
     print()
-    print("  KEY TECH MOVER:")
-    print("  NVDA  — Curl vs 212.50, no go under, watch mkt    bias=LONG")
+    print("  TOP DAY2 CATALYST:")
+    print("  MU    — Wells Fargo raises PT $550→$1,220              bias=LONG")
+    print("          Long over 1h MTF breakout; short if 1h MTF rejects")
     print()
-    print("  EARNINGS DAY2 SHORT:")
-    print("  PANW  — Bearish under PML / 34-50 break           bias=SHORT")
+    print("  400 PSYCH SETUPS:")
+    print("  AVGO  — Mizuho reiterates Outperform, PT $530          bias=LONG")
+    print("          400 psych + Daily 50/55 MTF; no go under 395")
+    print("  AMD   — $2B UK AI investment, MTF above                bias=LONG")
+    print("          Long if 485 holds for MTF push; outer res 497.50")
     print()
-    print("  SKIP:  MRVL ($300 magnet, too extended)")
-    print("  SKIP:  CRWD (neutral curl bias, no clean direction)")
-    print("  SKIP:  META / GOOGL (choppy premarket)")
-    print("  SKIP:  AMD (wide range, no clean setup)")
+    print("  SKIP:  TSLA ('watchout amateur moves')")
+    print("  SKIP:  NVDA (neutral cloud bias, 'watch cloud holds')")
+    print("  SKIP:  SNDK ($1,620 — too expensive for sizing)")
+    print("  SKIP:  CRWD (wide unclear range)")
     print("=" * 65)
 
     setups = {
         # ── Index ETFs ─────────────────────────────────────────────────
-        "SPY":  {"support": 749.77, "resistance": 752.65, "bias": "any",
-                 "note": "Trade vs PM levels + follow clouds; VIX 16.33 key"},
-        "QQQ":  {"support": 733.00, "resistance": 737.60, "bias": "any",
-                 "note": "Tech ETF direction play; outer res 741.00"},
-        # ── Earnings beats ─────────────────────────────────────────────
-        "AVGO": {"support": 403.50, "resistance": 412.00, "bias": "long",
-                 "note": "Beat all metrics; curl over 412 if semis strong; outer res 416"},
-        "COST": {"support": 978.00, "resistance": 984.00, "bias": "long",
-                 "note": "Beat revs +14.5% YoY; bullish above 975; target $1K breakout"},
-        # ── Key tech mover ─────────────────────────────────────────────
-        "NVDA": {"support": 211.39, "resistance": 214.50, "bias": "long",
-                 "note": "Curl vs 212.50; no go under 211.39; watch market direction"},
-        # ── Earnings Day2 short ────────────────────────────────────────
-        "PANW": {"support": 275.80, "resistance": 277.00, "bias": "short",
-                 "note": "Earnings Day2; bearish under PML / 34-50 break"},
+        "SPY":  {"support": 735.50, "resistance": 742.00, "bias": "any",
+                 "note": "Gap up Iran/Israel; VIX 19 gate; trade vs PM levels; outer res 745.30"},
+        "QQQ":  {"support": 708.60, "resistance": 717.00, "bias": "any",
+                 "note": "Tech ETF, gap up open; outer res 721.50"},
+        # ── S&P 500 index addition ──────────────────────────────────────
+        "MRVL": {"support": 284.00, "resistance": 288.50, "bias": "long",
+                 "note": "Joins S&P 500 — forced buying catalyst; MTF bullish; long over MTF"},
+        # ── Top Day2 catalyst ──────────────────────────────────────────
+        "MU":   {"support": 918.00, "resistance": 940.00, "bias": "long",
+                 "note": "Day2; Wells Fargo PT $550→$1,220; long over 1h MTF breakout"},
+        # ── 400 psych setups ───────────────────────────────────────────
+        "AVGO": {"support": 397.00, "resistance": 400.00, "bias": "long",
+                 "note": "Mizuho PT $530, 400 psych; Daily 50/55 MTF; no go under 395"},
+        "AMD":  {"support": 480.00, "resistance": 490.00, "bias": "long",
+                 "note": "$2B UK AI investment; MTF above; long if 485 holds; outer res 497.50"},
     }
 
     all_trades = run_multi_today(setups)
